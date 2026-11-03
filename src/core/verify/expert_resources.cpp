@@ -200,10 +200,18 @@ bool Verifier::dm_init(std::string& err) {
     // is never staged; the addresses are read again before a batch window when the source's places moved (a swap).
     // The count staged for m misses balances the pool's time for the rest against the copy's, both reading host
     // memory at once.
+    // Layers may differ in blob size: one stride fits the largest, and each layer's copy moves its own bytes
+    // (dec_moe_stage takes the layer's blob size).  The cost model below takes the smallest blob, the most common.
     bool stage = d->pdev < 0 && d->xp.empty() && lb_ == 0 && le_ == g.n_layers && hand_in_ == nullptr &&
-                 warm_src_ != nullptr && staging_ != nullptr && warm_src_->pcie_layer(0) && lay.fmt[0].bytes % 16 == 0;
-    for (int64_t l = 1; stage && l < g.n_layers; ++l) stage = lay.fmt[(size_t) l].bytes == lay.fmt[0].bytes;
-    const int64_t blob = (int64_t) lay.fmt[0].bytes, stride = dec_moe_stage_stride(blob);
+                 warm_src_ != nullptr && staging_ != nullptr && warm_src_->pcie_layer(0);
+    int64_t blob = 0, blob_max = 0;
+    for (int64_t l = 0; stage && l < g.n_layers; ++l) {
+        const int64_t b = (int64_t) lay.fmt[(size_t) l].bytes;
+        stage = b % 16 == 0;
+        blob = blob == 0 ? b : std::min(blob, b);
+        blob_max = std::max(blob_max, b);
+    }
+    const int64_t stride = dec_moe_stage_stride(blob_max);
     const int stage_slots =
         (int) std::min<int64_t>(kDmStageMax, (int64_t) (kStagingBlobs * (int64_t) lay.max_blob) / stride);
     if (stage && stage_slots >= 1) {
