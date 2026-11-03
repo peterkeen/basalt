@@ -135,18 +135,22 @@ bool Request::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) 
     // `auto:N` and a fixed N keep the operator's number.  (Chunking changes the GEMM tiles and so the rounding of
     // a prompt's K/V; the answers can differ from another chunking by greedy near-ties.)
     int64_t cap = runtime_.read_cap();
-    // Loan limits while slots decode: the loan takes only slots whose expert has a RAM copy (a lent slot
-    // is refilled from RAM, never read from the file, before the slots decode again), and a read beside
-    // them stays within kLendCapDecoding slots (they keep their experts in the cache).  A read on an idle
-    // engine may refill lent slots from the file, so a larger chunk is worth it.  The chunk shrinks to the
-    // loan, but not below the smallest chunk the prompt path runs.
+    // Loan limits while slots decode (see decoding_loan_limit): a read alone stops the slots, so it lends as on an
+    // idle engine; a read beside them stays within kLendCapDecoding slots (they keep their experts in the cache) and
+    // within the lent slots refilled from RAM plus those one chunk's funded file reads refill (the RAM floor keeps
+    // that much file cache).  The chunk shrinks to the loan, but not below the smallest chunk the prompt path runs.
     int64_t loan_lim = std::numeric_limits<int64_t>::max();
     if (runtime_.batch_on()) {
-        if (beside) loan_lim = runtime_.kLendCapDecoding;
         // the RAM-backed slots are the cache's last ones: those still live after the KV took its share
-        if (runtime_.src.complement_ready())
-            loan_lim = std::min<int64_t>(loan_lim, std::max<int64_t>(0, runtime_.src.resident_lent_slots() -
-                                                                         (runtime_.xcache.full_slots() - runtime_.xcache.slots())));
+        const bool ram_limited = runtime_.src.complement_ready();
+        const int64_t ram_lent = ram_limited ? runtime_.src.resident_lent_slots() -
+                                                   (runtime_.xcache.full_slots() - runtime_.xcache.slots())
+                                             : 0;
+        const int64_t file_lent = (int64_t) (basalt::platform::kPromptFileReadBytes /
+                                             std::max<uint64_t>(1, basalt::kernels::cpu::expert_layout().max_blob));
+        const int64_t lim = serve_loans::decoding_loan_limit(beside, runtime_.kLendCapDecoding, ram_limited, ram_lent,
+                                                             file_lent);
+        if (lim >= 0) loan_lim = lim;
     }
     if (loan_lim != std::numeric_limits<int64_t>::max() && !runtime_.pf_parts.empty() && runtime_.pf_parts[0].first >= 0) {
         const int64_t lc = std::max<int64_t>(256, engine_local::biggest_chunk(cap, [&](int64_t t) {

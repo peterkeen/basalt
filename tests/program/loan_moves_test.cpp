@@ -140,6 +140,19 @@ Cache random_cache(int32_t layers, int32_t n, int32_t slots) {
 }  // namespace
 
 int main() {
+    // the loan while slots decode: a read alone lends as on an idle engine; a read beside them stays within the cap,
+    // and with a RAM copy within the RAM-backed lent slots plus the funded file refills
+    {
+        CHECK(decoding_loan_limit(false, 1216, true, 0, 900) == -1);       // alone, budget (no RAM-backed lent slots)
+        CHECK(decoding_loan_limit(false, 1216, false, 0, 900) == -1);      // alone, no RAM copy
+        CHECK(decoding_loan_limit(true, 1216, false, 0, 900) == 1216);     // beside, no RAM copy: the cap
+        CHECK(decoding_loan_limit(true, 1216, true, 2679, 900) == 1216);   // beside, whole lend region in RAM: the cap
+        CHECK(decoding_loan_limit(true, 1216, true, 0, 900) == 900);       // beside, budget: the file refills alone
+        CHECK(decoding_loan_limit(true, 1216, true, 200, 900) == 1100);    // beside, part in RAM
+        CHECK(decoding_loan_limit(true, 1216, true, -50, 900) == 900);     // the KV took more than the RAM-backed slots
+        CHECK(decoding_loan_limit(true, 1216, true, 0, 0) == 0);           // nothing funded: no loan
+        CHECK(decoding_loan_limit(true, -1, true, 10, 10) == 0);           // a negative cap lends nothing
+    }
     // the split: the entries the next loan takes again, and the rest, in their order
     {
         const std::vector<LentEntry> lent = {{3, 90}, {7, 40}, {1, 75}, {9, 60}};

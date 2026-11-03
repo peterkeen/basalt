@@ -39,4 +39,10 @@ struct RoutedTrade {
 int64_t plan_routed_trades(const float* use, const int32_t* slot, const uint8_t* in_ram, const uint8_t* lent_out,
                            int32_t n, int64_t first, std::vector<RoutedTrade>& out);
 
+/// The most cache slots a prompt read's loan takes while slots decode; -1: no limit.  A read alone (`beside` false)
+/// stops the slots until it ends, so it lends as on an idle engine.  A read beside them takes at most `cap_beside`
+/// slots and, when `ram_limited` (a RAM copy is in use), at most the lent slots refilled from RAM (`ram_lent`) plus
+/// those one chunk's funded file reads refill (`file_lent`).
+int64_t decoding_loan_limit(bool beside, int64_t cap_beside, bool ram_limited, int64_t ram_lent, int64_t file_lent);
+
 }  // namespace basalt::program::serve

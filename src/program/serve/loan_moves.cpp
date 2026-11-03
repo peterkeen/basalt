@@ -34,4 +34,11 @@ int64_t plan_routed_trades(const float* use, const int32_t* slot, const uint8_t*
     return routed;
 }
 
+int64_t decoding_loan_limit(bool beside, int64_t cap_beside, bool ram_limited, int64_t ram_lent, int64_t file_lent) {
+    if (!beside) return -1;
+    int64_t lim = std::max<int64_t>(0, cap_beside);
+    if (ram_limited) lim = std::min(lim, std::max<int64_t>(0, ram_lent) + std::max<int64_t>(0, file_lent));
+    return lim;
+}
+
 }  // namespace basalt::program::serve
