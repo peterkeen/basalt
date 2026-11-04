@@ -62,9 +62,20 @@ All CLI, all off.
 
 The per-layer n-gram (PLE) table stays on disk and its rows are read as needed.
 
+Which file the table comes from is a separate question from how it is read. By default it is the model file's own
+`gguf` section (`--model`): the pack carries `per_layer_token_embd.weight` next to the source tensors. With
+`--ple-file PATH` the engine reads that tensor out of another GGUF - a plain GGUF shard holding the table alone, or
+a whole model GGUF that happens to carry it among its other tensors - while the six `blk.1.ple_*` weights, the
+dense weights and the experts keep coming from the pack. The row values are the table's bytes through the same
+dequantizer either way, so pointing at a file whose table is byte-identical to the pack's changes nothing; a
+*different* table (another quantization, or a table trained differently) is a different model, and the engine says
+which file it used in its start-up line (`PLE on, table N rows of FILE (TYPE)`) and folds that file into the hash
+that binds a parked conversation on disk.
+
 | Flag | Binary | Value, default | What it does |
 | --- | --- | --- | --- |
 | `--ple-io` | engine | `direct`, `ram`; `direct` | `direct`: unbuffered reads, the table never enters RAM or the file cache. `ram`: map the file with the whole table locked in RAM at start. |
+| `--ple-file` | engine | path, unset | Read `per_layer_token_embd.weight` from this GGUF instead of from the model file. IQ4_NL, Q5_0 or Q8_0, shape `[160, rows]`; other tensors may share the file. A relative path is taken against the engine's working directory, so give an absolute one in a config file. |
 | `--ple-row-cache` | engine | rows, 1048576 | A bounded cache of fetched rows, 90 B each; `0` turns it off. |
 | `--ple-inflight` | engine | integer, 256 | Outstanding reads. |
 | `--ple-delay-us` | engine | microseconds, 0 | Fault injection: each row read completes no earlier than this. |

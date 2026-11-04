@@ -175,7 +175,8 @@ nearest stored state before it. A conversation whose last checkpoint (the end of
 behind is stored as of that checkpoint, with no running state of its own: the next turn goes on from there, and a reply sent
 back as it was is read again. A later prompt that starts with a stored conversation (its tokens, or one of its checkpoints) reads it back cut at that point
 and goes on from there, after a restart too: the wait is the drive reading the K/V cache. A file is bound to the model file, the stored-conversation format and the settings that change the state
-(the KV type, the rope, the draft layer, control vectors); every part of it carries a hash, and a file that does not
+(the KV type, the rope, the draft layer, control vectors), and to the file `--ple-file` reads the n-gram table from,
+since the PLE writes state from that table's rows; every part of it carries a hash, and a file that does not
 check out is deleted, never restored. After a second without input (no slot decoding) the engine writes each conversation that has grown 4096 tokens past its
 stored copy, so a crash or a kill loses at most that much. The budget caps the folder, least recently used conversations first (a shared
 file goes with the last conversation that uses it), and a write always leaves 4 GiB of the volume free. Writes on the
