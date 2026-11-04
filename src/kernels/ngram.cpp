@@ -204,12 +204,12 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     if (alone ? need != have : t->offset + need > have) {
         char buf[256];
         std::snprintf(buf, sizeof buf,
-                      "PLE table size mismatch: %llu rows x %d B = %llu at offset %llu, but the file holds %llu from "
+                      "size mismatch: %llu rows x %d B = %llu at offset %llu, but the file holds %llu from "
                       "data_start %llu",
                       (unsigned long long) impl_->n_rows, (int) impl_->rb, (unsigned long long) need,
                       (unsigned long long) t->offset, (unsigned long long) have,
                       (unsigned long long) impl_->file->data_start());
-        err = buf;
+        err = "per_layer_token_embd.weight in " + gguf_path + ": " + buf;
         close();
         return false;
     }
