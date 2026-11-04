@@ -197,8 +197,12 @@ int run(int argc, char** argv) {
         // the source tensors hold the PLE table
         try {
             const basalt::GgufModel model(o.native_shards);
-            if (model.find("per_layer_token_embd.weight") == nullptr) {
-                basalt::log::error("basalt generate", "%s has no per_layer_token_embd.weight", o.model.c_str());
+            // --ple-file supplies the table from another file, so a pack that carries none still starts.  The six
+            // blk.1.ple_* weights are NOT part of that: they stay in the pack, and their absence is refused where
+            // the block is wired (src/program/generate/vision.cpp).
+            if (o.ple_file.empty() && model.find("per_layer_token_embd.weight") == nullptr) {
+                basalt::log::error("basalt generate", "%s has no per_layer_token_embd.weight (give --model a pack "
+                                     "that carries one, or point --ple-file at a GGUF that does)", o.model.c_str());
                 return 2;
             }
         } catch (const std::exception& e) {

@@ -106,6 +106,7 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
 enum class PleFormat { IQ4_NL, Q5_0, Q8_0 };
 
 struct PleTable::Impl {
+    std::string path;            // the file the table was opened from (the model file, or --ple-file)
     GgufFile* file = nullptr;
     const uint8_t* data = nullptr;
     uint64_t n_rows = 0;
@@ -152,6 +153,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err) {
 
 bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoOptions& io) {
     close();
+    impl_->path = gguf_path;
     try {
         impl_->file = new GgufFile(gguf_path);
     } catch (const std::exception& e) {
@@ -164,9 +166,13 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // [160, 320001536]: ne0 = 160 is the FAST axis, so the ROW index is shape[1] and a row is contiguous.
+    // [160, 320001536]: ne0 = 160 is the FAST axis, so the ROW index is shape[1] and a row is contiguous.  The
+    // message names the file: with --ple-file it is not the file the weights come from.
     if (t->shape.size() != 2 || t->shape[0] != (uint64_t) PLE_HEAD_DIM) {
-        err = "per_layer_token_embd.weight has an unexpected shape";
+        std::string dims;
+        for (size_t d = 0; d < t->shape.size(); ++d) dims += (d ? ", " : "") + std::to_string(t->shape[d]);
+        err = "per_layer_token_embd.weight in " + gguf_path + " has shape [" + dims + "], expected [" +
+              std::to_string(PLE_HEAD_DIM) + ", rows]";
         close();
         return false;
     }
@@ -175,7 +181,8 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     else if (std::strcmp(t->type_name(), "Q5_0") == 0) impl_->fmt = PleFormat::Q5_0;
     else if (std::strcmp(t->type_name(), "Q8_0") == 0) impl_->fmt = PleFormat::Q8_0;
     else {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0 or Q8_0";
+        err = std::string("per_layer_token_embd.weight in ") + gguf_path + " is " + t->type_name() +
+              ", not IQ4_NL, Q5_0 or Q8_0";
         close();
         return false;
     }
@@ -186,14 +193,11 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     impl_->n_rows = t->shape[1];
     impl_->data = impl_->file->tensor_data(*t);
 
-    // THE CHECK THAT MAKES THE OFFSET FALSIFIABLE.  The manifest's `shard2_tensor.offset` is 0, but that is
-    // the offset within the GGUF's DATA SECTION: the file's first 192 bytes are a header, and reading at 0
-    // would decode the header plus 192 bytes of shifted rows - still plausible IQ4_NL, and wrong for every
-    // row.  `GgufFile` parses the header, so `tensor_data` is already correct; this asserts the tensor
-    // exactly fills the file from there, which is what makes the whole arrangement checkable rather than
-    // assumed.  A wrong data offset would leave a different remainder.
-    // A shard may hold other tensors too (Swift 1.5's shard 1 holds layers 0-12 and the table): the table must
-    // then fit inside the file at its own offset; alone in its shard (the original's shard 2) it fills it exactly.
+    // THE CHECK THAT MAKES THE OFFSET FALSIFIABLE.  A tensor's offset counts from the GGUF's data section, not from
+    // byte 0: reading at 0 would decode the header plus shifted rows - still plausible IQ4_NL, wrong for every row.
+    // GgufFile parses the header, so tensor_data is already the tensor's own bytes; this asserts the table fills the
+    // file exactly from there when it is the file's only tensor, and fits inside the file at its own offset when the
+    // file holds others as well.  A wrong data offset would leave a different remainder.
     const uint64_t need = impl_->n_rows * (uint64_t) impl_->rb;
     const uint64_t have = impl_->file->file_size() - impl_->file->data_start();
     const bool alone = impl_->file->tensors().size() == 1;
@@ -287,6 +291,7 @@ void PleTable::prefetch_rows(const uint32_t* rows16) {
 void PleTable::close() {
     wait_prefetches();
     impl_->reader.close();
+    impl_->path.clear();
     impl_->pending = false;
     impl_->locked = false;   // the unmap below releases the lock
     impl_->mode = PleIo::Mmap;
@@ -299,6 +304,7 @@ void PleTable::close() {
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
+const std::string& PleTable::source() const { return impl_->path; }
 bool PleTable::locked() const { return impl_->locked; }
 const char* PleTable::format() const {
     return impl_->fmt == PleFormat::Q8_0 ? "Q8_0" : impl_->fmt == PleFormat::Q5_0 ? "Q5_0" : "IQ4_NL";

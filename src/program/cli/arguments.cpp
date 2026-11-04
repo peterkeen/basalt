@@ -60,6 +60,7 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--dump-mixed") o.dump_mixed = next("--dump-mixed");
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
         else if (a == "--ple-io") o.ple_io = next("--ple-io");
+        else if (a == "--ple-file") o.ple_file = next("--ple-file");
         else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
         else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
         else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));

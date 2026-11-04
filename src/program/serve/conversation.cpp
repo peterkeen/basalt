@@ -35,9 +35,31 @@ bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss,
     return false;
 }
 
+/// One file's contribution to a conversation identity: its size and 16 sampled 64 KiB blocks of it.  A file that
+/// cannot be opened contributes its size only, which is what the call that sized it recorded.
+static uint64_t identity_file_hash(const std::string& path, uint64_t h) {
+    using basalt::core::conversation_store_hash;
+    uint64_t size = 0;
+    basalt::platform::file_size(path, size);
+    h = conversation_store_hash(&size, sizeof size, h);
+    const int fd = basalt::platform::open_fd_utf8(path);
+    std::vector<uint8_t> buf((size_t) 64 << 10);
+    const uint64_t n = std::min<uint64_t>(buf.size(), size);
+    for (int i = 0; i < 16 && fd >= 0 && n > 0; ++i) {
+        const uint64_t off = (size - n) / 15 * (uint64_t) i;
+        if (!basalt::platform::pread_all(fd, buf.data(), n, off)) break;
+        h = conversation_store_hash(buf.data(), (size_t) n, h);
+    }
+    basalt::platform::close_fd(fd);
+    return h;
+}
+
 /// The identity parked conversations on disk are written under (conversation_store.hpp): the model file
 /// (its size and samples of its bytes) and the settings that change a state's bytes - the K/V type, the rope, the draft
 /// layer, the image encoder, control vectors.  A file of another identity is never restored.
+/// With --ple-file the n-gram table is not in the model file at all, and its values go into the state bytes the PLE
+/// writes (the layer-1 history), so its own identity is folded in the same way.  Without the flag nothing here
+/// changes: caches parked before the flag existed stay readable.
 uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeometry& g) {
     using basalt::core::conversation_store_hash;
     char num[512];
@@ -51,18 +73,8 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
     const int64_t geo[] = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_v_heads, g.n_head_kv,
                            g.head_dim, g.idx_key_dim, g.n_expert, g.n_ff};
     h = conversation_store_hash(geo, sizeof geo, h);
-    uint64_t size = 0;
-    basalt::platform::file_size(o.model, size);
-    h = conversation_store_hash(&size, sizeof size, h);
-    const int fd = basalt::platform::open_fd_utf8(o.model);
-    std::vector<uint8_t> buf((size_t) 64 << 10);
-    const uint64_t n = std::min<uint64_t>(buf.size(), size);
-    for (int i = 0; i < 16 && fd >= 0 && n > 0; ++i) {
-        const uint64_t off = (size - n) / 15 * (uint64_t) i;
-        if (!basalt::platform::pread_all(fd, buf.data(), n, off)) break;
-        h = conversation_store_hash(buf.data(), (size_t) n, h);
-    }
-    basalt::platform::close_fd(fd);
+    h = identity_file_hash(o.model, h);
+    if (!o.ple_file.empty()) h = identity_file_hash(o.ple_file, h);
     return h;
 }
 

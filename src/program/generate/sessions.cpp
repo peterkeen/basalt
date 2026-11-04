@@ -192,8 +192,10 @@ int sessions(Context& context) {
             basalt::log::error("basalt generate", "the PLE run is not ready after construction");
             return 1;
         }
-        basalt::log::info("basalt generate", "PLE on, table %llu rows of %s",
-                     (unsigned long long) ple_table.rows(), o.model.c_str());
+        // The file the table was opened from, not --model: with --ple-file the two differ, and this is the line an
+        // operator reads to confirm which table the run is on.
+        basalt::log::info("basalt generate", "PLE on, table %llu rows of %s (%s)",
+                     (unsigned long long) ple_table.rows(), ple_table.source().c_str(), ple_table.format());
     }
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];

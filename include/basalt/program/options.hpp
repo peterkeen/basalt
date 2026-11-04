@@ -37,6 +37,10 @@ struct Options {
     double yarn_beta_slow = 1.0;        ///< --yarn-beta-slow F
     /// The files the source tensors are read from: the model file, which serves them as a GGUF.
     std::vector<std::string> native_shards;
+    /// `--ple-file PATH`: read the n-gram table (`per_layer_token_embd.weight`) from this GGUF instead of from the
+    /// model file's `gguf` section; the `blk.1.ple_*` weights stay in the model file.  Empty = the model file, as
+    /// every existing run and cache behaves today.  A relative path is made absolute against the working directory.
+    std::string ple_file;
     /// How the n-gram table is read.  Direct (default) = unbuffered SSD reads, table never in RAM.
     std::string ple_io = "direct";
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables

@@ -162,18 +162,25 @@ public:
     /// Starts the SSD keep-alive window again from now (see PleReader::rearm_keepalive).
     void rearm_keepalive();
 
-    /// Maps the ORIGINAL second GGUF shard read-only.  The tensor's data does NOT start at file offset 0:
-    /// the manifest's `shard2_tensor.offset` is relative to the GGUF's DATA SECTION, and the header before it
-    /// is 192 bytes.  Reading at 0 would silently decode the header plus 192 bytes of shifted rows - still
-    /// plausible IQ4_NL, which is why the reader takes the offset from a real GGUF parse (`GgufFile`, the
-    /// project's validated reader) and checks that the tensor exactly fills the rest of the file.
+    /// Maps the file holding the table read-only: the model file (a .basalt pack carries the table in its `gguf`
+    /// section, and the ORIGINAL arrangement was the model's second GGUF shard), or the standalone GGUF named by
+    /// `--ple-file`.  The tensor's data does NOT start at file offset 0: the manifest's `shard2_tensor.offset` is
+    /// relative to the GGUF's DATA SECTION, and the header before it is 192 bytes.  Reading at 0 would silently
+    /// decode the header plus 192 bytes of shifted rows - still plausible IQ4_NL, which is why the reader takes
+    /// the offset from a real GGUF parse (`GgufFile`, the project's validated reader) and checks that the table
+    /// fills the file from there: exactly, when it is the file's only tensor, and within its own offset range
+    /// when the file holds other tensors too (the `--ple-file` case, and Swift 1.5's shard 1).
     bool open(const std::string& gguf_path, std::string& err);
     void close();
     bool is_open() const;
+    /// The file the table was opened from, empty after `close`.  This is what the start-up log and the
+    /// conversation identity report as the table's source, so a `--ple-file` table is never mistaken for the
+    /// pack's own.
+    const std::string& source() const;
     /// True when `PleIoOptions::lock` was asked for and the whole table was locked (false: pages only pre-touched).
     bool locked() const;
     uint64_t rows() const;
-    /// "IQ4_NL" or "Q5_0".
+    /// "IQ4_NL", "Q5_0" or "Q8_0".
     const char* format() const;
 
     /// 16 row indices -> 2560 floats.  The gathered rows are flattened HEAD-SLOWEST: row h's 160 values

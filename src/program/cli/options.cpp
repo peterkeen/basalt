@@ -5,6 +5,7 @@
 #include "basalt/kernels/rope_scaling.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/program/options.hpp"
 
 #include <algorithm>
@@ -80,6 +81,22 @@ std::optional<int> prepare_input_options(Options& o) {
         o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
         basalt::log::error("basalt generate", "invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us");
         return 2;
+    }
+    if (!o.ple_file.empty()) {
+        // The table's file is not read until the PLE is wired, well after the model has been loaded: an unreadable
+        // path has to die here, naming the flag, rather than as a failed tensor read two minutes later.  Open it for
+        // real (`open_fd_utf8`, which is what the table reader does), and spell the path out absolutely, since the
+        // engine's working directory is not necessarily where the flag was typed.
+        const int fd = basalt::platform::open_fd_utf8(o.ple_file);
+        uint64_t bytes = 0;
+        const bool sized = fd >= 0 && basalt::platform::file_size(o.ple_file, bytes) && bytes > 0;
+        if (fd >= 0) basalt::platform::close_fd(fd);
+        if (!sized) {
+            basalt::log::error("basalt generate", "--ple-file %s is not a readable file", o.ple_file.c_str());
+            return 2;
+        }
+        std::string real;
+        if (basalt::platform::absolute_path(o.ple_file, real)) o.ple_file = real;
     }
     if (o.kv == "q4") o.kv = "q4_0";
     if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
