@@ -10,6 +10,7 @@
 #include "basalt/platform/mapped_file.hpp"
 #include "basalt/platform/memory.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -42,6 +43,12 @@ PleConsts ple_artifact_consts() {
         c.offset[i] = offset[i];
     }
     return c;
+}
+
+uint64_t ple_row_space(const PleConsts& c) {
+    uint64_t space = 0;
+    for (int h = 0; h < PLE_N_HEADS; ++h) space = std::max(space, c.offset[h] + c.vocab[h]);
+    return space;
 }
 
 uint64_t ngram_mixed(const int64_t* ctx, const uint64_t* mult, int n) {
@@ -311,6 +318,18 @@ const char* PleTable::format() const {
 }
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
+
+bool PleTable::covers(const PleConsts& c, std::string& err) const {
+    const uint64_t need = ple_row_space(c);
+    if (impl_->n_rows >= need) return true;
+    char buf[256];
+    std::snprintf(buf, sizeof buf,
+                  "the n-gram table in %s has %llu rows, but the n-gram hash indexes rows up to %llu: it is a "
+                  "table for a different model, and reading it would run past its end",
+                  impl_->path.c_str(), (unsigned long long) impl_->n_rows, (unsigned long long) (need - 1));
+    err = buf;
+    return false;
+}
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
 
 void PleTable::read_row(uint32_t row, float* out160) const {

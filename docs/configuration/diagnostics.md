@@ -75,7 +75,7 @@ that binds a parked conversation on disk.
 | Flag | Binary | Value, default | What it does |
 | --- | --- | --- | --- |
 | `--ple-io` | engine | `direct`, `ram`; `direct` | `direct`: unbuffered reads, the table never enters RAM or the file cache. `ram`: map the file with the whole table locked in RAM at start. |
-| `--ple-file` | engine | path, unset | Read `per_layer_token_embd.weight` from this GGUF instead of from the model file. IQ4_NL, Q5_0 or Q8_0, shape `[160, rows]`; other tensors may share the file. A relative path is taken against the engine's working directory, so give an absolute one in a config file. |
+| `--ple-file` | engine | path, unset | Read `per_layer_token_embd.weight` from this GGUF instead of from the model file. IQ4_NL, Q5_0 or Q8_0, shape `[160, rows]`, and rows enough to reach every index the n-gram hash produces (320,001,446 for this architecture, so a table from another model is refused at start rather than read past its end); other tensors may share the file. A relative path is taken against the engine's working directory, so give an absolute one in a config file. |
 | `--ple-row-cache` | engine | rows, 1048576 | A bounded cache of fetched rows, 90 B each; `0` turns it off. |
 | `--ple-inflight` | engine | integer, 256 | Outstanding reads. |
 | `--ple-delay-us` | engine | microseconds, 0 | Fault injection: each row read completes no earlier than this. |

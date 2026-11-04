@@ -66,6 +66,11 @@ struct PleConsts {
 };
 PleConsts ple_artifact_consts();
 
+/// One past the largest row index the hash produces: the biggest `offset[h] + vocab[h]` over the sixteen heads.  A
+/// table has to have at least this many rows.  The packs carry a few more, because the row space is rounded up to a
+/// whole number of 128-row blocks.
+uint64_t ple_row_space(const PleConsts& c);
+
 /// `mixed_n = (ctx[0]*m[0]) ^ (ctx[1]*m[1]) ^ ... ^ (ctx[n-1]*m[n-1])` in uint64.
 ///
 /// Exposed separately so a test can assert the XOR STRUCTURE directly rather than only its consequences.
@@ -180,6 +185,10 @@ public:
     /// True when `PleIoOptions::lock` was asked for and the whole table was locked (false: pages only pre-touched).
     bool locked() const;
     uint64_t rows() const;
+    /// True when the table has a row for every index `ngram_rows` can hand it (`ple_row_space`).  A table with fewer
+    /// rows is not a smaller model but a read past the end of the mapping, so this is checked before the first token.
+    /// The message names the file the table was opened from: with `--ple-file` that is not the weights' file.
+    bool covers(const PleConsts& c, std::string& err) const;
     /// "IQ4_NL", "Q5_0" or "Q8_0".
     const char* format() const;
 

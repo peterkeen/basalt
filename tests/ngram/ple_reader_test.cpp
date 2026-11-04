@@ -512,6 +512,23 @@ int ple_file_check(const std::string& dir) {
         }
         std::filesystem::remove(path);
     }
+    // And that the table reaches every row the hash can ask for.  The hash's ids run to `ple_row_space - 1`; a table
+    // short of that is a read past the end of the mapping, which is what a table from another model would be.
+    const k::PleConsts consts = k::ple_artifact_consts();
+    CHECK(k::ple_row_space(consts) == 320001446ull, "ple_row_space() is %llu, expected 320001446",
+          (unsigned long long) k::ple_row_space(consts));
+    {
+        k::PleTable t;
+        k::PleIoOptions io;
+        io.mode = k::PleIo::Direct;
+        err.clear();
+        CHECK(t.open(alone, err, io), "open %s: %s", alone.c_str(), err.c_str());
+        CHECK(!t.covers(consts, err), "a %llu-row table covered the hash's %llu-row space",
+              (unsigned long long) t.rows(), (unsigned long long) k::ple_row_space(consts));
+        CHECK(err.find(alone) != std::string::npos, "the row-space error does not name the file: '%s'", err.c_str());
+        CHECK(err.find("320001445") != std::string::npos, "the row-space error does not name the row: '%s'", err.c_str());
+        t.close();
+    }
     for (const std::string& p : {alone, shared}) std::filesystem::remove(p);
     std::printf("--ple-file table cases: %s\n", g_fail ? "FAILED" : "OK");
     return g_fail ? 1 : 0;
@@ -543,6 +560,10 @@ int cross_check(const std::vector<std::string>& paths) {
         std::string err;
         if (!t->open(path, err, io)) {
             std::fprintf(stderr, "%s: %s\n", path.c_str(), err.c_str());
+            return 1;
+        }
+        if (!t->covers(k::ple_artifact_consts(), err)) {
+            std::fprintf(stderr, "%s\n", err.c_str());
             return 1;
         }
         std::printf("%s: per_layer_token_embd.weight %s, %llu rows, from %s\n", path.c_str(), t->format(),

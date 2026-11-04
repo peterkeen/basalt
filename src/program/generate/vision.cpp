@@ -44,6 +44,11 @@ int vision(Context& context) {
         if (!ple_table.open(ple_path, err, pio)) {
             return fatal_start_error(err);
         }
+        // The hash's row ids run to `ple_row_space - 1`, so a table with fewer rows is a read past the end of the
+        // mapping, not a smaller model.  This matters once the table can come from a file the operator chose.
+        if (!ple_table.covers(basalt::kernels::ple_artifact_consts(), err)) {
+            return fatal_start_error(err);
+        }
         if (pio.mode == basalt::kernels::PleIo::Direct) {
             // --ple-io direct's random reads (up to --ple-inflight at once) are for SSDs; a rotational disk can take
             // longer than the stall watchdog's limit for one prompt chunk's rows.  Recommended, not forced.
