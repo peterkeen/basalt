@@ -1,8 +1,13 @@
 // tests/ngram/ple_reader_test.cpp - the direct SSD row reader against ground truth.
 //
-//   ple_reader_test --selftest [--dir D]        synthetic table file; CPU and disk only, no model, no GPU
+//   ple_reader_test --selftest [--dir D]        synthetic table file; CPU and disk only, no model, no GPU.
+//                                               Includes the --ple-file cases: the table read out of a GGUF that is
+//                                               not the model file, alone or among other tensors, and the files it
+//                                               has to refuse.
 //   ple_reader_test --gguf SHARD2 [--rows N]    the real table: Direct vs Mmap bytes for N random rows (+ the
 //                                               16 rows of every token in --tokens FILE), with read latencies
+//   ple_reader_test --cross-check A[,B,...]     the same rows of several real tables (a .basalt pack and/or plain
+//                                               GGUFs), compared: same encoding must be bit-identical
 //
 // Every row the synthetic table holds encodes its own index, so a wrong offset, a straddle mishandled or a
 // dedup slot mixed up shows as a mismatch rather than as plausible data.
@@ -12,6 +17,7 @@
 #include "basalt/ngram/ple_reader.hpp"
 #include "basalt/platform/direct_file.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -20,6 +26,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -353,6 +360,243 @@ template <class T> void put(std::vector<uint8_t>& b, T v) {
     std::memcpy(b.data() + n, &v, sizeof(T));
 }
 
+// ---- a table in a GGUF of its own: what `--ple-file` opens -----------------------------------------------
+//
+// The table is normally a section of the model file.  `--ple-file` points at a GGUF that is not the model: the
+// table alone in a plain GGUF (a real IQ3_S shard 2 is exactly that), or a table sitting among a model's other
+// tensors (the Q8_0 n-gram GGUFs, and Swift 1.5's shard 1).  These cases are synthetic and small on purpose.
+struct SynthTensor {
+    std::string name;
+    uint32_t type;                      // ggml type id: 2 Q4_0, 8 Q8_0, 20 IQ4_NL
+    std::vector<uint64_t> shape;
+    std::vector<uint8_t> bytes;
+};
+
+// Writes a GGUF v3 holding `ts`, in order, each payload starting at a multiple of 32 from the data section's start
+// (no metadata, so the reader's default alignment of 32 is what the layout assumes).  Tensor offsets in a GGUF are
+// relative to the data section, which starts after the header: an offset of 0 is NOT byte 0 of the file.
+bool write_gguf(const std::string& path, const std::vector<SynthTensor>& ts) {
+    std::vector<uint8_t> h;
+    put<uint32_t>(h, 0x46554747u);   // "GGUF"
+    put<uint32_t>(h, 3);
+    put<uint64_t>(h, ts.size());
+    put<uint64_t>(h, 0);             // no metadata
+    std::vector<uint64_t> offs;
+    uint64_t off = 0;
+    for (const auto& t : ts) { offs.push_back(off); off = (off + t.bytes.size() + 31) / 32 * 32; }
+    for (size_t i = 0; i < ts.size(); ++i) {
+        put<uint64_t>(h, ts[i].name.size());
+        h.insert(h.end(), ts[i].name.begin(), ts[i].name.end());
+        put<uint32_t>(h, (uint32_t) ts[i].shape.size());
+        for (uint64_t d : ts[i].shape) put<uint64_t>(h, d);
+        put<uint32_t>(h, ts[i].type);
+        put<uint64_t>(h, offs[i]);
+    }
+    h.resize((h.size() + 31) / 32 * 32, 0);
+    for (size_t i = 0; i < ts.size(); ++i) {
+        h.insert(h.end(), ts[i].bytes.begin(), ts[i].bytes.end());
+        h.resize((h.size() + 31) / 32 * 32, 0);
+    }
+    std::ofstream f(path, std::ios::binary);
+    f.write((const char*) h.data(), (std::streamsize) h.size());
+    return (bool) f;
+}
+
+// Q8_0 bytes for `rows` PLE rows, finite scales, every byte a deterministic function of (row, block, index):
+// a wrong offset, a wrong stride or another tensor's bytes read as the table show up as a mismatch rather than as
+// plausible data.
+std::vector<uint8_t> q8_table_bytes(uint32_t rows, uint32_t seed) {
+    std::vector<uint8_t> b((size_t) rows * k::PLE_ROW_BYTES_Q8_0);
+    for (uint32_t r = 0; r < rows; ++r) {
+        uint8_t* row = b.data() + (size_t) r * k::PLE_ROW_BYTES_Q8_0;
+        for (int blk = 0; blk < k::PLE_HEAD_DIM / 32; ++blk) {
+            const uint16_t scale = (uint16_t) (0x2400 + ((r * 7919u + blk * 104729u + seed) % 0x1800u));
+            std::memcpy(row + blk * 34, &scale, 2);
+            for (int i = 0; i < 32; ++i)
+                row[blk * 34 + 2 + i] = (uint8_t) (r * 31u + blk * 17u + i * 7u + seed);
+        }
+    }
+    return b;
+}
+
+// What `--ple-file` has to get right, and what it has to refuse.
+int ple_file_check(const std::string& dir) {
+    constexpr uint32_t ROWS = 4096;
+    const std::vector<uint8_t> table = q8_table_bytes(ROWS, 3);
+    const std::vector<uint8_t> decoy = q8_table_bytes(ROWS / 2, 99);
+    const std::string alone = dir + "/ple_file_alone.gguf";
+    const std::string shared = dir + "/ple_file_shared.gguf";
+    CHECK(write_gguf(alone, {{"per_layer_token_embd.weight", 8, {k::PLE_HEAD_DIM, ROWS}, table}}), "write %s", alone.c_str());
+    // The decoy comes FIRST: it is what a reader that assumed the table starts at the data section's beginning
+    // would decode, and it is a different table, so the mistake is a mismatch and not a plausible row.
+    CHECK(write_gguf(shared, {{"token_embd.weight", 8, {k::PLE_HEAD_DIM * 2, ROWS / 2}, decoy},
+                              {"per_layer_token_embd.weight", 8, {k::PLE_HEAD_DIM, ROWS}, table}}),
+          "write %s", shared.c_str());
+
+    // The same bytes at a non-zero offset must give the same rows, in both read modes, and the values must be what
+    // the shared dequantizer makes of them (an independent anchor, not another pass of the same reader).
+    const size_t T = 8;                       // gather_rows takes 16 row ids per token
+    std::vector<uint32_t> rows(T * k::PLE_N_HEADS);
+    for (size_t i = 0; i < rows.size(); ++i) rows[i] = (uint32_t) ((i * 3571u + 17u) % ROWS);
+    std::string err;
+    std::vector<float> ref;
+    for (const char* mode_name : {"mmap", "direct"}) {
+        for (const std::string& path : {alone, shared}) {
+            k::PleTable t;
+            k::PleIoOptions io;
+            io.mode = std::strcmp(mode_name, "mmap") == 0 ? k::PleIo::Mmap : k::PleIo::Direct;
+            io.cache_rows = 0;    // every row from the file, so a wrong offset cannot hide behind a cache hit
+            CHECK(t.open(path, err, io), "%s open %s: %s", mode_name, path.c_str(), err.c_str());
+            CHECK(t.rows() == ROWS && std::strcmp(t.format(), "Q8_0") == 0,
+                  "%s %s: %llu rows of %s", mode_name, path.c_str(), (unsigned long long) t.rows(), t.format());
+            CHECK(t.source() == path, "%s %s: source() is '%s'", mode_name, path.c_str(), t.source().c_str());
+            std::vector<float> got(T * k::NG_N_EMBD, 0.f);
+            CHECK(t.gather_rows(rows.data(), T, got.data(), err), "%s gather %s: %s", mode_name, path.c_str(), err.c_str());
+            if (ref.empty()) ref = got;
+            else CHECK(ref == got, "%s: rows from %s differ from the other file's", mode_name, path.c_str());
+            // 16 rows of one token through the block's own entry point, decoded independently.
+            for (uint32_t h = 0; h < 4; ++h) {
+                const uint32_t row = rows[h];
+                std::vector<float> want(k::PLE_HEAD_DIM);
+                const uint8_t* src = table.data() + (size_t) row * k::PLE_ROW_BYTES_Q8_0;
+                for (int b = 0; b < k::PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q8_0(src + b * 34, want.data() + b * 32);
+                std::vector<float> one(k::PLE_HEAD_DIM);
+                t.read_row(row, one.data());
+                CHECK(want == one, "%s %s: read_row(%u) is not the Q8_0 decode of its bytes", mode_name, path.c_str(), row);
+            }
+            t.close();
+            CHECK(t.source().empty() && !t.is_open(), "close() left the table open or its source set");
+        }
+    }
+
+    // What it refuses, and that the reason names the file: with --ple-file the file asked for is not the one the
+    // weights come from, and "unexpected shape" alone would not say which table was meant.
+    struct Bad {
+        const char* what;
+        std::vector<SynthTensor> tensors;
+        const char* expect;
+    };
+    const std::vector<uint8_t> short_table(table.begin(), table.begin() + (size_t) (ROWS - 64) * k::PLE_ROW_BYTES_Q8_0);
+    const std::vector<Bad> bad = {
+        // the table under a different name: the file holds a table-shaped tensor the PLE has no part in
+        {"no table", {{"token_embd.weight", 8, {k::PLE_HEAD_DIM, ROWS}, table}}, "not in"},
+        // a real Q8_0 shape that is not the PLE's: 192 values per row, and its payload sized to match, so the
+        // refusal is the shape and not an artifact of a byte count
+        {"wrong shape", {{"per_layer_token_embd.weight", 8, {192, ROWS / 2},
+                          std::vector<uint8_t>((size_t) (ROWS / 2) * 6 * 34, 0x5A)}}, "shape [192, 2048]"},
+        // a table of an encoding the reader does not have
+        {"wrong type", {{"per_layer_token_embd.weight", 2, {k::PLE_HEAD_DIM, ROWS},
+                         std::vector<uint8_t>((size_t) ROWS * 90, 0x5A)}}, "is Q4_0, not IQ4_NL"},
+        // alone in its file but a row count that does not match the bytes present
+        {"short, alone", {{"per_layer_token_embd.weight", 8, {k::PLE_HEAD_DIM, ROWS + 64}, short_table}},
+         "size mismatch"},
+        // and the same table in a file with others, where the fit is checked at its own offset
+        {"short, shared", {{"token_embd.weight", 8, {k::PLE_HEAD_DIM * 2, ROWS / 2}, decoy},
+                           {"per_layer_token_embd.weight", 8, {k::PLE_HEAD_DIM, ROWS + 64}, short_table}},
+         "size mismatch"},
+    };
+    for (const Bad& b : bad) {
+        const std::string path = dir + "/ple_file_bad.gguf";
+        CHECK(write_gguf(path, b.tensors), "write %s (%s)", path.c_str(), b.what);
+        for (const k::PleIo mode : {k::PleIo::Direct, k::PleIo::Mmap}) {
+            k::PleTable t;
+            k::PleIoOptions io;
+            io.mode = mode;
+            err.clear();
+            const bool opened = t.open(path, err, io);
+            CHECK(!opened, "%s: a %s table opened", b.what, mode == k::PleIo::Direct ? "direct" : "mapped");
+            CHECK(err.find(b.expect) != std::string::npos,
+                  "%s: the error was '%s', expected it to mention '%s'", b.what, err.c_str(), b.expect);
+            CHECK(err.find(path) != std::string::npos, "%s: the error does not name the file: '%s'", b.what, err.c_str());
+            t.close();
+        }
+        std::filesystem::remove(path);
+    }
+    for (const std::string& p : {alone, shared}) std::filesystem::remove(p);
+    std::printf("--ple-file table cases: %s\n", g_fail ? "FAILED" : "OK");
+    return g_fail ? 1 : 0;
+}
+
+// The real files.  Each path is a .basalt pack (its `gguf` section registered as the view the loaders use, which
+// is what the engine does) or a plain GGUF; the same rows are read from every one of them and compared.  Tables of
+// one encoding have to agree bit for bit; a table of another encoding is a different quantization of the same
+// source, so its error against the first file is what gets reported.
+int cross_check(const std::vector<std::string>& paths) {
+    constexpr size_t T = 64;                      // tokens -> 16 row ids each
+    std::vector<std::unique_ptr<k::PleTable>> tabs;
+    std::vector<uint32_t> rows;
+    for (const std::string& path : paths) {
+        // A .basalt is not a GGUF: its tensor directory comes from its `meta` section, and the model's own loaders
+        // register that view.  Do the same before opening the table out of it.
+        basalt::core::ModelFile mf;
+        std::string merr;
+        if (mf.open(path, merr)) {
+            if (!mf.load_meta(merr) || !mf.register_gguf_view(merr)) {
+                std::fprintf(stderr, "%s: %s\n", path.c_str(), merr.c_str());
+                return 1;
+            }
+        }
+        auto t = std::make_unique<k::PleTable>();
+        k::PleIoOptions io;                       // Direct, the production mode
+        io.cache_rows = 0;                        // every row comes from the drive
+        std::string err;
+        if (!t->open(path, err, io)) {
+            std::fprintf(stderr, "%s: %s\n", path.c_str(), err.c_str());
+            return 1;
+        }
+        std::printf("%s: per_layer_token_embd.weight %s, %llu rows, from %s\n", path.c_str(), t->format(),
+                    (unsigned long long) t->rows(), t->source().c_str());
+        if (tabs.empty()) {
+            std::mt19937_64 rng(20261029);
+            const uint64_t n = t->rows();
+            rows.push_back(0);
+            rows.push_back(1);
+            rows.push_back((uint32_t) (n / 3));
+            rows.push_back((uint32_t) (n - 2));
+            rows.push_back((uint32_t) (n - 1));
+            for (size_t i = 5; i < T * k::PLE_N_HEADS; ++i) rows.push_back((uint32_t) (rng() % n));
+        } else if (tabs.back()->rows() != t->rows()) {
+            std::fprintf(stderr, "%s: %llu rows, but the first file has %llu\n", path.c_str(),
+                         (unsigned long long) t->rows(), (unsigned long long) tabs.back()->rows());
+            return 1;
+        }
+        tabs.push_back(std::move(t));
+    }
+    if (tabs.size() < 2) { std::fprintf(stderr, "give two or more files\n"); return 2; }
+    std::vector<std::vector<float>> got(tabs.size());
+    for (size_t i = 0; i < tabs.size(); ++i) {
+        std::string err;
+        got[i].assign(T * k::NG_N_EMBD, 0.f);
+        if (!tabs[i]->gather_rows(rows.data(), T, got[i].data(), err)) {
+            std::fprintf(stderr, "%s: gather_rows: %s\n", paths[i].c_str(), err.c_str());
+            return 1;
+        }
+    }
+    bool failed = false;
+    for (size_t i = 1; i < tabs.size(); ++i) {
+        size_t exact = 0; double max_abs = 0, sum_abs = 0, num = 0, den = 0;
+        for (size_t j = 0; j < got[i].size(); ++j) {
+            const float a = got[0][j], b = got[i][j];
+            if (a == b) ++exact;             // equal floats, so equal bits except for a signed zero
+            const double d = std::fabs((double) a - (double) b);
+            max_abs = std::max(max_abs, d);
+            sum_abs += d;
+            num += d * d;
+            den += (double) a * (double) a;
+        }
+        const double rel = den > 0 ? std::sqrt(num / den) : (num > 0 ? 1e9 : 0);
+        const bool same_fmt = std::strcmp(tabs[0]->format(), tabs[i]->format()) == 0;
+        const bool ok = same_fmt ? (exact == got[i].size()) : rel < 0.05;
+        std::printf("%s vs %s (%s): %zu/%zu values exact, max|d| %.4g, mean|d| %.4g, rel rms %.4g -> %s (%s)\n",
+                    tabs[0]->format(), tabs[i]->format(), same_fmt ? "same encoding" : "different encoding",
+                    exact, got[i].size(), max_abs, sum_abs / (double) got[i].size(), rel,
+                    ok ? "agrees" : "DISAGREES", same_fmt ? "bit-identical required" : "within 5% rms");
+        if (!ok) failed = true;
+    }
+    std::printf("PLE table cross-check: %s\n", failed ? "FAILED" : "OK");
+    return failed ? 1 : 0;
+}
+
 // PleTable::warm_rows on a synthetic one-tensor GGUF (Q8_0 rows): rows read ahead come back byte-identical to the
 // mapped table's, are served from the row cache (a read held back by injected delay is not waited for), and in
 // Mmap mode the call does nothing.
@@ -421,6 +665,7 @@ int warm_rows_check(const std::string& dir) {
 
 int main(int argc, char** argv) {
     std::string gguf, dir = std::filesystem::temp_directory_path().string(), tokens;
+    std::vector<std::string> cross;
     int rows = 20000;
     uint32_t inflight = 64;
     bool direct_first = false;
@@ -430,6 +675,12 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") self = true;
+        else if (a == "--cross-check" && i + 1 < argc) {
+            std::stringstream ss(argv[++i]);
+            std::string p;
+            while (std::getline(ss, p, ','))
+                if (!p.empty()) cross.push_back(p);
+        }
         else if (a == "--dir" && i + 1 < argc) dir = argv[++i];
         else if (a == "--gguf" && i + 1 < argc) gguf = argv[++i];
         else if (a == "--rows" && i + 1 < argc) rows = std::atoi(argv[++i]);
@@ -438,7 +689,7 @@ int main(int argc, char** argv) {
         else if (a == "--direct-first") direct_first = true;
         else if (a == "--direct-only") direct_only = true;
         else if (a == "--stress" && i + 1 < argc) stress_secs = std::atof(argv[++i]);
-        else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F] [--stress SECS]\n"); return 2; }
+        else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F] [--stress SECS] | --cross-check A[,B,...]\n"); return 2; }
     }
     if (self) {
         // ng::ROW_BYTES (90, IQ4_NL, production default), 110 (Q5_0) and 170 (Q8_0) rows through the
@@ -448,8 +699,10 @@ int main(int argc, char** argv) {
         const int r170 = selftest(dir, k::PLE_ROW_BYTES_Q8_0);
         const int q8 = q8_decode_check();
         const int warm = warm_rows_check(dir);
-        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : q8 != 0 ? q8 : warm;
+        const int pf = ple_file_check(dir);
+        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : q8 != 0 ? q8 : warm != 0 ? warm : pf;
     }
+    if (!cross.empty()) return cross_check(cross);
     if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, stress_secs);
     std::fprintf(stderr, "nothing to do\n");
     return 2;
