@@ -520,7 +520,8 @@ int ple_file_check(const std::string& dir) {
 // The real files.  Each path is a .basalt pack (its `gguf` section registered as the view the loaders use, which
 // is what the engine does) or a plain GGUF; the same rows are read from every one of them and compared.  Tables of
 // one encoding have to agree bit for bit; a table of another encoding is a different quantization of the same
-// source, so its error against the first file is what gets reported.
+// source, so its error against the first file is what gets reported, and it has to stay small: reading the wrong
+// bytes looks like noise, not like a plausible row.
 int cross_check(const std::vector<std::string>& paths) {
     constexpr size_t T = 64;                      // tokens -> 16 row ids each
     std::vector<std::unique_ptr<k::PleTable>> tabs;
@@ -573,6 +574,11 @@ int cross_check(const std::vector<std::string>& paths) {
         }
     }
     bool failed = false;
+    for (size_t i = 0; i < tabs.size(); ++i) {
+        const size_t bad = (size_t) std::count_if(got[i].begin(), got[i].end(),
+                                                  [](float v) { return !std::isfinite(v); });
+        if (bad) { std::fprintf(stderr, "%s: %zu non-finite values\n", paths[i].c_str(), bad); failed = true; }
+    }
     for (size_t i = 1; i < tabs.size(); ++i) {
         size_t exact = 0; double max_abs = 0, sum_abs = 0, num = 0, den = 0;
         for (size_t j = 0; j < got[i].size(); ++j) {
@@ -586,11 +592,16 @@ int cross_check(const std::vector<std::string>& paths) {
         }
         const double rel = den > 0 ? std::sqrt(num / den) : (num > 0 ? 1e9 : 0);
         const bool same_fmt = std::strcmp(tabs[0]->format(), tabs[i]->format()) == 0;
-        const bool ok = same_fmt ? (exact == got[i].size()) : rel < 0.05;
+        // Two files holding the same encoding of the same table are byte-identical, so every value has to match.
+        // Across encodings there is nothing to match bit for bit: a re-quantization of the same source table sits a
+        // few percent away (the gap is the coarser encoding's own error), while reading the wrong bytes - a wrong
+        // offset, a wrong row stride - is uncorrelated with the right ones, which puts the relative rms near sqrt(2).
+        // 0.15 separates the two.
+        const bool ok = same_fmt ? (exact == got[i].size()) : rel < 0.15;
         std::printf("%s vs %s (%s): %zu/%zu values exact, max|d| %.4g, mean|d| %.4g, rel rms %.4g -> %s (%s)\n",
                     tabs[0]->format(), tabs[i]->format(), same_fmt ? "same encoding" : "different encoding",
                     exact, got[i].size(), max_abs, sum_abs / (double) got[i].size(), rel,
-                    ok ? "agrees" : "DISAGREES", same_fmt ? "bit-identical required" : "within 5% rms");
+                    ok ? "agrees" : "DISAGREES", same_fmt ? "bit-identical required" : "rel rms under 0.15");
         if (!ok) failed = true;
     }
     std::printf("PLE table cross-check: %s\n", failed ? "FAILED" : "OK");
