@@ -280,12 +280,50 @@ void elastic_backing() {
     check(conversation_kv_restore(image,f.state,f.g,3,true,err)==false,"a shorter extent than the image is incompatible");
     f.state.kv_arena=nullptr;
 }
+
+void hostless_draft_ring() {
+    Fixture a_fix(kKvInt8, 0), b_fix(kKvInt8, 0);
+    auto init_ring = [](Fixture& f) {
+        f.state.kv_mode = 2;
+        f.state.n_slots = 4;   // 16 cells in ring, 96 max_cells (24 pages)
+        f.state.idx_pooled_rows = 2;
+        f.state.host = KvHostPools{};
+        kv_ring_table(f.state.page_table, f.state.n_pages, f.state.n_slots, nullptr);
+    };
+    init_ring(a_fix);
+    init_ring(b_fix);
+    for (int64_t upto : {0LL, 8LL, 16LL, 65LL, 96LL}) {
+        std::string err;
+        a_fix.fill(41);
+        b_fix.fill(193);
+        cuda_check(cudaDeviceSynchronize());
+        ConversationKv saved, again, copied_img;
+        check(conversation_kv_save(saved, a_fix.state, a_fix.g, upto, false, err), "hostless ring save");
+        check(saved.bytes() == conversation_kv_bytes(a_fix.state, a_fix.g, upto, false), "hostless ring byte estimate");
+        uint64_t fp = 0;
+        check(conversation_kv_verify(saved, a_fix.state, a_fix.g, upto, false, fp, err), "hostless ring verify source");
+        check(conversation_kv_copy(a_fix.state, b_fix.state, a_fix.g, upto, false, err), "hostless ring copy");
+        cuda_check(cudaDeviceSynchronize());
+        check(conversation_kv_save(copied_img, b_fix.state, b_fix.g, upto, false, err) && equal(saved, copied_img),
+              "hostless ring copy exactness");
+        b_fix.fill(211);
+        cuda_check(cudaDeviceSynchronize());
+        check(conversation_kv_restore(saved, b_fix.state, b_fix.g, upto, false, err), "hostless ring restore");
+        cuda_check(cudaDeviceSynchronize());
+        check(conversation_kv_save(again, b_fix.state, b_fix.g, upto, false, err) && equal(saved, again),
+              "hostless ring A/B/A exactness");
+        uint64_t fp2 = 0;
+        check(conversation_kv_verify(saved, b_fix.state, b_fix.g, upto, false, fp2, err) && fp2 == fp,
+              "hostless ring verify restored");
+    }
+}
 }
 
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     elastic_backing();
+    hostless_draft_ring();
     for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode : {0,1,2}) {
         if (fmt==3 && mode!=0) continue;
         Fixture f(fmt,mode);

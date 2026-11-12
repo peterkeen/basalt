@@ -109,23 +109,21 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     // A window that reaches every cell keeps the K/V whole (-1): the drafter has no resolve to stream it.
     const bool windowed = window > 0 && window < max_cells;
     int64_t ring = windowed ? window + 4 * (int64_t) max_t + 64 : -1;
-    // with a store per batch slot (below) a store keeps the last pages of its sequence, the window and the cells a turn
-    // may roll back, as a ring (page p at p % ring); a streamed ring then reaches as far back, so every page a store
-    // keeps has its place in it when the sequence is swapped in
+    // with a store per batch slot (or an elastic server that may roll back to a turn checkpoint) the ring keeps the
+    // window and the cells a turn may roll back (page p at p % ring)
     const int64_t store_ring = windowed ? (window + kStoreRollback + 4 * (int64_t) max_t + 64 + s.page_size - 1) /
                                               s.page_size + 1
                                         : 0;
-    if (windowed && n_stores_ > 0) ring = store_ring * s.page_size;
+    if (windowed && (n_stores_ > 0 || qsa_kv_elastic() > 0)) ring = store_ring * s.page_size;
     // K8V4 never applies to the drafter: its own attention paths (below, and src/core/verify/) handle whole formats
     // only, whatever ring shape it takes (a window, or -1: fully resident).
     const bool kv_hybrid_was = qsa_kv_hybrid();
     const bool kv_int8_was = qsa_kv_int8();
     qsa_set_kv_hybrid(false);
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
-    // the draft K/V is elastic like the layers' (its arena grows and shrinks with the session's), except where a
-    // store per batch slot copies whole pools
+    // when unwindowed (ring < 0), the draft K/V is elastic unless batch stores require fixed pools
     const int64_t kv_elastic_was = qsa_kv_elastic();
-    if (n_stores_ > 0) qsa_set_kv_elastic(0);
+    if (n_stores_ > 0 && ring < 0) qsa_set_kv_elastic(0);
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {

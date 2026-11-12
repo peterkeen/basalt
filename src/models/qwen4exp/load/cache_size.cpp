@@ -260,17 +260,21 @@ int cache_size(Context& context) {
         }
     }
     // the elastic KV: what the sessions' unbacked cells would take is the cache's tail, lent back to them on demand
-    uint64_t kv_tail_bytes = 0;
+    uint64_t kv_tail_sum = 0;
     if (kv_floor > 0) {
         auto add = [&](const basalt::core::SessionState& s) {
-            kv_tail_bytes += basalt::core::session_kv_bytes_for(s, s.max_cells) - basalt::core::session_kv_bytes_for(s, kv_floor);
+            kv_tail_sum += basalt::core::session_kv_bytes_for(s, s.max_cells) - basalt::core::session_kv_bytes_for(s, kv_floor);
         };
         add(ss);
         if (!bslot_ss.empty())
             for (const auto& u : bslot_ss[0])
                 if (u.get() != &ss) add(*u);
-        xcache.set_elastic_tail((int64_t) kv_tail_bytes);
     }
+    const int64_t floor_slots_est = (o.prefill_chunk > 0 && pf_borrow)
+        ? ((int64_t) basalt::prefill::Prefill::bytes_needed(g, ss, 256) + (int64_t) cache_slot_bytes - 1) /
+              (int64_t) cache_slot_bytes + 128
+        : 0;
+    uint64_t kv_tail_bytes = 0;
     if (o.expert_cache > 0) {
         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
         auto shrink_to = [&](int64_t keep_bytes) -> bool {
@@ -294,6 +298,14 @@ int cache_size(Context& context) {
             for (const int64_t s : sized_slots) b += (s + 255) / 256 * 256;
             return b;
         };
+        auto floor_bytes = [&]() -> int64_t {
+            if (floor_slots_est <= 0) return 0;
+            if (sized_slots.empty()) return std::min<int64_t>(cache_bytes(), floor_slots_est * (int64_t) cache_slot_bytes);
+            int64_t b = 0;
+            const size_t n = std::min<size_t>(sized_slots.size(), (size_t) floor_slots_est);
+            for (size_t i = 0; i < n; ++i) b += (sized_slots[i] + 255) / 256 * 256;
+            return b;
+        };
         // With `--expert-cache auto` the reserve must still be free once the slots are WRITTEN: an allocation may not
         // be resident until it is touched, and the free figure read before it can be too high.  A cache sized from it
         // could fill the card, the driver would then page, and a request that needed a page back while the verify
@@ -302,6 +314,11 @@ int cache_size(Context& context) {
         int failed = 0;
         int zero_reads = 0;
         for (int attempt = 0;; ++attempt) {
+            if (kv_floor > 0) {
+                const int64_t headroom = std::max<int64_t>(0, cache_bytes() - floor_bytes());
+                kv_tail_bytes = std::min<uint64_t>(kv_tail_sum, (uint64_t) headroom);
+                xcache.set_elastic_tail((int64_t) kv_tail_bytes);
+            }
             bool ok = false;
             {
                 ok = sized_slots.empty()

@@ -86,7 +86,7 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     if (upto < 0 || upto > st.max_cells || st.n_pages < 0 || l.cells / l.page_size > st.n_pages ||
         st.kv_mode < 0 || st.kv_mode > 2 || st.n_slots <= 0 ||
         (st.kv_mode == 0 && st.n_slots < st.n_pages) ||
-        l.pooled_rows > st.idx_pooled_rows || (st.kv_mode != 0 && !st.host.present())) {
+        l.pooled_rows > st.idx_pooled_rows || (st.kv_mode == 1 && !st.host.present())) {
         error = "conversation snapshot: invalid K/V extent or missing authoritative host pool";
         return false;
     }
@@ -167,9 +167,12 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     image.page_size = l.page_size;
     image.pooled_rows = l.pooled_rows;
     image.idx_dim = g.idx_key_dim;
-    const auto src = pools(st);
+    const bool ring_only = st.kv_mode == 2 && !st.host.present();
+    const auto src = pools(st, ring_only);
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    const int64_t n1 = l.cells / l.page_size;
+    const int64_t ring_b0 = ring_only ? std::max<int64_t>(0, n1 - st.n_slots) : 0;
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
@@ -177,7 +180,25 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         dst[i]->resize_for_overwrite(sizes[i]);   // every new byte is copied in below
-        if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
+        if (ring_only && i < 4 && sizes[i] > 0 && n1 > 0) {
+            const size_t page_bytes = sizes[i] / (size_t) n1;
+            const size_t zend = (size_t) ring_b0 * page_bytes;
+            if (keep < zend)
+                dst[i]->visit(keep, zend - keep, [](uint8_t* p, size_t n, size_t) { std::memset(p, 0, n); return true; });
+            const int64_t p_start = std::max<int64_t>(ring_b0, (int64_t) (keep / page_bytes));
+            for (int64_t page = p_start; page < n1;) {
+                const int64_t sl = page % st.n_slots;
+                const int64_t run = std::min<int64_t>(n1 - page, st.n_slots - sl);
+                const size_t off = (size_t) page * page_bytes;
+                const size_t from = std::max(keep, off);
+                const size_t span = (size_t) run * page_bytes - (from - off);
+                const uint8_t* ring_src = static_cast<const uint8_t*>(src[i]) + (size_t) sl * page_bytes + (from - off);
+                if (!dst[i]->visit(from, span, [&](uint8_t* p, size_t n, size_t at) {
+                        return transfer(p, ring_src + (at - from), n, error);
+                    })) return false;
+                page += run;
+            }
+        } else if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                 return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
@@ -200,7 +221,7 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     }
     for (size_t i = 0; i < src.size(); ++i)
         if (src[i]->size() != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
-    const auto dst = pools(st);
+    const auto dst = pools(st, st.kv_mode == 2 && !st.host.present());
     for (size_t i = 0; i < src.size(); ++i)
         if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
     return true;
@@ -212,7 +233,7 @@ bool settle_resident(const QsaState& st, const ModelGeometry& g, int64_t upto, s
     // VRAM slots still contain the outgoing conversation. Resolve must refill
     // them from the restored authoritative pools before any attention reads.
     if (st.kv_mode == 1) basalt::kernels::kv_stream_reset(st.map, nullptr);
-    if (st.kv_mode == 2 && upto > 0) {
+    if (st.kv_mode == 2 && st.host.present() && upto > 0) {
         auto shapes = basalt::kernels::qsa_real_shapes();
         shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
         const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
@@ -232,11 +253,30 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     Layout l{};
     if (!layout(st, g, upto, index, l, error) || !backed(st, l, error)) return false;
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
-    const auto dst = pools(st);
-    for (size_t i = 0; i < src.size(); ++i)
+    const bool ring_only = st.kv_mode == 2 && !st.host.present();
+    const auto dst = pools(st, ring_only);
+    const int64_t n1 = l.cells / l.page_size;
+    const int64_t ring_b0 = ring_only ? std::max<int64_t>(0, n1 - st.n_slots) : 0;
+    for (size_t i = 0; i < src.size(); ++i) {
+        if (ring_only && i < 4) {
+            if (src[i]->empty() || n1 <= 0) continue;
+            const size_t page_bytes = src[i]->size() / (size_t) n1;
+            for (int64_t page = ring_b0; page < n1;) {
+                const int64_t sl = page % st.n_slots;
+                const int64_t run = std::min<int64_t>(n1 - page, st.n_slots - sl);
+                const size_t off = (size_t) page * page_bytes;
+                uint8_t* ring_dst = static_cast<uint8_t*>(dst[i]) + (size_t) sl * page_bytes;
+                if (!src[i]->visit(off, (size_t) run * page_bytes, [&](const uint8_t* p, size_t n, size_t at) {
+                        return transfer(ring_dst + (at - off), p, n, error);
+                    })) return false;
+                page += run;
+            }
+            continue;
+        }
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
+    }
     return settle_resident(st, g, upto, error);
 }
 
@@ -252,11 +292,33 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
         error = "conversation snapshot: the two sessions' K/V layouts differ";
         return false;
     }
-    const auto src = pools(from);
-    const auto dst = pools(to);
+    const bool from_ring_only = from.kv_mode == 2 && !from.host.present();
+    const bool to_ring_only = to.kv_mode == 2 && !to.host.present();
+    if (from_ring_only != to_ring_only || (from_ring_only && from.n_slots != to.n_slots)) {
+        error = "conversation snapshot: incompatible draft ring layouts";
+        return false;
+    }
+    const auto src = pools(from, from_ring_only);
+    const auto dst = pools(to, to_ring_only);
     const std::array<size_t,5> sizes = {a.data, a.value_data, a.scales, a.value_scales, a.pooled};
+    const int64_t n1 = a.cells / a.page_size;
+    const int64_t b0 = from_ring_only ? std::max<int64_t>(0, n1 - from.n_slots) : 0;
     for (size_t i = 0; i < sizes.size(); ++i) {
         if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+        if (from_ring_only && i < 4) {
+            if (!sizes[i] || n1 <= 0) continue;
+            const size_t page_bytes = sizes[i] / (size_t) n1;
+            for (int64_t page = b0; page < n1;) {
+                const int64_t sl = page % from.n_slots;
+                const int64_t run = std::min<int64_t>(n1 - page, from.n_slots - sl);
+                if (!transfer(static_cast<uint8_t*>(dst[i]) + (size_t) sl * page_bytes,
+                              static_cast<const uint8_t*>(src[i]) + (size_t) sl * page_bytes,
+                              (size_t) run * page_bytes, error))
+                    return false;
+                page += run;
+            }
+            continue;
+        }
         if (!transfer(dst[i], src[i], sizes[i], error)) return false;
     }
     return settle_resident(to, g, upto, error);
@@ -281,12 +343,38 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
         return true;
     };
     const std::array<const ConversationBuffer*, 5> saved = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
-    const auto authoritative = pools(st);
-    for (size_t i = 0; i < saved.size(); ++i)
+    const bool ring_only = st.kv_mode == 2 && !st.host.present();
+    const auto authoritative = pools(st, ring_only);
+    for (size_t i = 0; i < saved.size(); ++i) {
+        if (ring_only && i < 4) {
+            if (saved[i]->empty()) continue;
+            const int64_t end = image.cells / image.page_size;
+            const int64_t begin = std::max<int64_t>(0, end - st.n_slots);
+            const size_t page_bytes = saved[i]->size() / (size_t) end;
+            if (begin > 0) {
+                bool zeros_ok = true;
+                saved[i]->visit(0, (size_t) begin * page_bytes, [&](const uint8_t* p, size_t n, size_t) {
+                    for (size_t k = 0; k < n; ++k) {
+                        if (p[k] != 0) { zeros_ok = false; return false; }
+                        hash ^= 0u;
+                        hash *= 1099511628211ull;
+                    }
+                    return true;
+                });
+                if (!zeros_ok) { error = "conversation snapshot: hostless draft ring prefix is nonzero"; return false; }
+            }
+            for (int64_t page = begin; page < end; ++page)
+                if (!saved[i]->visit((size_t) page * page_bytes, page_bytes, [&](const uint8_t* p, size_t n, size_t at) {
+                        const size_t offset = (size_t) (page % st.n_slots) * page_bytes + at - (size_t) page * page_bytes;
+                        return compare(static_cast<const uint8_t*>(authoritative[i]) + offset, p, n, true);
+                    })) return false;
+            continue;
+        }
         if (!saved[i]->visit(0, saved[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
             })) return false;
-    if (st.kv_mode == 2 && image.cells > 0) {
+    }
+    if (st.kv_mode == 2 && st.host.present() && image.cells > 0) {
         const auto resident = pools(st, true);
         const int64_t end = image.cells / image.page_size;
         const int64_t begin = std::max<int64_t>(0, end - st.n_slots);

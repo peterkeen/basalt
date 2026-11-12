@@ -6,7 +6,7 @@ using namespace mtp_detail;
 
 void MtpDrafter::kv_restore(int64_t upto) {
     const OnDevice on_device(device_);
-    if (st_.kv_mode != 2 || upto <= 0) return;
+    if (st_.kv_mode != 2 || upto <= 0 || !st_.host.present()) return;
     // the ring's blocks below `upto`, from the host copy: a checkpoint resume may have left later cells in them
     const basalt::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);

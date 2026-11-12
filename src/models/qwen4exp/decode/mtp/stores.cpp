@@ -112,10 +112,29 @@ bool MtpDrafter::save_store(int id, int64_t cells, ConversationKv& out, std::str
         note_cells(0, store_hi_[(size_t) prev]);
         if (!flush(id, err)) return false;
     }
-    // the image comes from the host copy, which a ring shares with every sequence: the one it holds puts its pages
-    // back first (another sequence's come from its store, below)
+    // the image comes from the host copy when one exists, else from the sequence's own ring (earlier pages zeroed)
     if (cur_ == id && !ring_to_host(err)) return false;
-    if (!conversation_kv_save(out, st_, *g_, cells, false, err)) return false;
+    if (cur_ == id || st_.host.present()) {
+        if (!conversation_kv_save(out, st_, *g_, cells, false, err)) return false;
+    } else {
+        // size and zero-fill `out` for `cells` without reading `cur_`'s ring pages, then overlay `id`'s store below
+        if (!conversation_kv_save(out, st_, *g_, 0, false, err)) return false;
+        const basalt::kernels::QsaShapes s = shapes_of(*g_);
+        const int64_t n1 = ((cells + s.page_size - 1) / s.page_size);
+        out.cells = n1 * s.page_size;
+        KvArr lay[4];
+        const int na = kv_layout(lay);
+        ConversationBuffer* dst[4] = {&out.k, &out.v, &out.k_scale, &out.v_scale};
+        const int64_t keep = std::min<int64_t>(n1, store_ring_[(size_t) id]);
+        const int64_t zero_pages = n1 - keep;
+        for (int i = 0; i < na; ++i) {
+            const size_t total = (size_t) ((uint64_t) n1 * lay[i].page_bytes);
+            const size_t zbytes = (size_t) ((uint64_t) zero_pages * lay[i].page_bytes);
+            dst[i]->resize_for_overwrite(total);
+            if (zbytes > 0)
+                dst[i]->visit(0, zbytes, [](uint8_t* q, size_t m, size_t) { std::memset(q, 0, m); return true; });
+        }
+    }
     if (cur_ != id) {   // the pages the store keeps, over the working state's
         const OnDevice on_device(device_);
         KvArr lay[4];
@@ -143,7 +162,7 @@ bool MtpDrafter::save_store(int id, int64_t cells, ConversationKv& out, std::str
 }
 
 bool MtpDrafter::ring_to_host(std::string& err) {
-    if (st_.kv_mode != 2 || n_stores_ == 0) return true;
+    if (st_.kv_mode != 2 || n_stores_ == 0 || !st_.host.present()) return true;
     const OnDevice on_device(device_);
     const basalt::kernels::QsaShapes s = shapes_of(*g_);
     const size_t c = (size_t) cur_;
