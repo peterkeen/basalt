@@ -22,6 +22,7 @@ bool Prefill::Run::execute() {
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     owner.rows_in_place_ = false;
+    if (n > 0 && !core::session_host_kv_ensure(ss, pos0, pos0 + n, err, m.cs)) return false;
     if (m.hist_on && !rows_in_place) m.hist_tokens += n;   // a kept chunk's tokens counted in the run that kept it
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)

@@ -121,6 +121,7 @@ struct Prefill::Impl {
     PrefillStats* stats = nullptr;
     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
     basalt::kernels::KvHostPools stage;
+    int64_t stage_cells = 0;
     int32_t* ident_table = nullptr;
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;

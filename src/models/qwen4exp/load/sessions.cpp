@@ -197,11 +197,17 @@ int sessions(Context& context) {
             basalt::log::error("basalt generate", "session_init failed");
             return 1;
         }
-        if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
-            basalt::log::info("basalt generate", "KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
-                                 "%.2f GiB of pinned RAM",
-                         (long long) (ss.qsa_states[ss.qsa_primary()].n_slots * 4),
-                         (long long) o.max_context, (double) basalt::core::qsa_kv_host_bytes() / 1073741824.0);
+        if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
+            if (ss.qsa_states[ss.qsa_primary()].host.paged.present())
+                basalt::log::info("basalt generate", "KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V "
+                                     "paged on demand in shared 132 MiB pinned RAM slabs",
+                             (long long) (ss.qsa_states[ss.qsa_primary()].n_slots * 4), (long long) o.max_context);
+            else
+                basalt::log::info("basalt generate", "KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
+                                     "%.2f GiB of pinned RAM",
+                             (long long) (ss.qsa_states[ss.qsa_primary()].n_slots * 4),
+                             (long long) o.max_context, (double) basalt::core::qsa_kv_host_bytes() / 1073741824.0);
+        }
         // the PLE block above built everything but the history, which session_init has just carved
         ss.ple.hist = ss.ple_hist;
         // generate mode starts from an empty sequence, and nothing else zeroes this state before the prompt path or

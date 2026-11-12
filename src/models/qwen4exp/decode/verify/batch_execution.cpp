@@ -46,11 +46,14 @@ bool Verifier::stage_batch(const int* slots, const int* lens, int S, int hbase, 
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU; restart the engine"; return false; }
     if (basalt::kernels::wait_abort_code() != 0) { err = "verify: a device wait timed out in an earlier window; restart the engine"; return false; }
     const ModelGeometry& g = *g_;
-    for (int s = 0; s < S; ++s)
-        if (pos0[s] < 0 || pos0[s] + (lens != nullptr ? lens[s] : 1) > slots_[(size_t) slots[s]]->max_cells) {
+    for (int s = 0; s < S; ++s) {
+        const int n_seg = lens != nullptr ? lens[s] : 1;
+        if (pos0[s] < 0 || pos0[s] + n_seg > slots_[(size_t) slots[s]]->max_cells) {
             err = "verify: slot " + std::to_string(slots[s]) + " runs past its context";
             return false;
         }
+        if (!session_host_kv_ensure(*slots_[(size_t) slots[s]], pos0[s], pos0[s] + n_seg, err, cs_)) return false;
+    }
     refresh_ar();
     if (!capture_batch(R, hbase, err) || !capture_commit_batch(R, err)) return false;
     const Clock::time_point t0 = Clock::now();

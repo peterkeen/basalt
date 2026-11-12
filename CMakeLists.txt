@@ -482,6 +482,10 @@ if(BUILD_TESTING)
   target_link_libraries(kv_arena_test PRIVATE model_qwen4exp_engine)
   basalt_gpu_test(NAME kv_arena_test COMMAND kv_arena_test)
   set_tests_properties(kv_arena_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  add_executable(host_kv_pool_test tests/core/host_kv_pool_test.cpp)
+  target_link_libraries(host_kv_pool_test PRIVATE model_qwen4exp_engine)
+  basalt_gpu_test(NAME host_kv_pool_test COMMAND host_kv_pool_test)
+  set_tests_properties(host_kv_pool_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 endif()
 
 # `basalt` (generate.cpp): the engine program that composes the components into a token.  The prompt arrives as
@@ -1000,6 +1004,12 @@ add_executable(kv_stream_parity tests/models/qwen4exp/kernels/kv_stream_parity.c
 target_include_directories(kv_stream_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(kv_stream_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME kv_stream_parity COMMAND kv_stream_parity)
+
+# Paged HostKvPool / HostKvView streaming vs contiguous KvHostPools and CPU FP64 reference (GPU, synthetic, no model).
+add_executable(kv_stream_paged_parity tests/models/qwen4exp/kernels/kv_stream_paged_parity.cpp)
+target_include_directories(kv_stream_paged_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(kv_stream_paged_parity PRIVATE model_qwen4exp_prefill model_qwen4exp_engine model_qwen4exp_kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME kv_stream_paged_parity COMMAND kv_stream_paged_parity)
 
 # the hybrid K8V4 KV (INT8 K + rotated Q4_0 V) vs host references (GPU, synthetic, no model).
 add_executable(kv_hybrid_parity tests/models/qwen4exp/kernels/kv_hybrid_parity.cpp)

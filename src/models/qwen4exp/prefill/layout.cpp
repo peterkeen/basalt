@@ -50,12 +50,16 @@ bool fused_ring() {
     return all;
 }
 
-// the staging pool of a streamed session: every page of one layer (same sequence in init and bytes_needed)
+// the staging pool of a streamed session: one layer's pages up to `stage_cells` (0: the full context)
 void take_stage(Alloc& o, const core::SessionState& ss, const basalt::kernels::QsaShapes& s,
-                basalt::kernels::KvHostPools& st, bool& ok) {
+                basalt::kernels::KvHostPools& st, bool& ok, int64_t stage_cells) {
+    st = {};
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
     if (q0.kv_mode != 1) return;
-    const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;
+    const int64_t pages = stage_cells > 0
+        ? std::min<int64_t>(q0.n_pages, (stage_cells + s.page_size - 1) / s.page_size)
+        : q0.n_pages;
+    const size_t rows = (size_t) std::max<int64_t>(pages, 0) * s.n_head_kv * s.page_size;
     if (q0.kv_q4) {
         st.k_q4 = o.take<uint8_t>(rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
         st.v_q4 = o.take<uint8_t>(rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
@@ -327,7 +331,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) basalt::kernels::NG_HC_DIM, ok);
-    take_stage(o, ss, s, m.stage, ok);
+    take_stage(o, ss, s, m.stage, ok, m.stage_cells);
     m.T = (int64_t) T;
     return ok;
 }
@@ -369,7 +373,8 @@ double Prefill::pinned_share() { return g_pinned_share; }
 
 namespace { constexpr uint64_t kSizingSlack = 8u << 20; }   // alignment slack of a borrowed region
 
-uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                               int64_t stage_cells) {
     // the same allocation sequence as `init`, counted
     const size_t T = (size_t) chunk;
     bool ok = true;
@@ -402,7 +407,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     f(T * N);
     f((size_t) basalt::kernels::NG_HC_DIM);
     basalt::kernels::KvHostPools stage;
-    take_stage(o, ss, s, stage, ok);
+    take_stage(o, ss, s, stage, ok, stage_cells);
     return o.used + kSizingSlack;
 }
 

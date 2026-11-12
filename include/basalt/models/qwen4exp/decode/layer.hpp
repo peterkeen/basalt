@@ -30,6 +30,7 @@
 // all five would be a percent-level error on the three that matter (`s_gemv_q8k_parity`, `bf16_gemv_parity`).
 #pragma once
 
+#include "basalt/models/qwen4exp/decode/host_kv_pool.hpp"
 #include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/core/weights.hpp"
 
@@ -231,6 +232,8 @@ struct QsaState {
     int64_t n_slots = 0;
     basalt::kernels::KvHostPools host;
     basalt::kernels::KvStreamMap map;
+    HostKvPool* host_pool = nullptr;
+    HostKvTable host_tab;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 
     float* idx_tail = nullptr;       ///< (idx_block - 1, idx_dim): the raw tail of the block being filled
@@ -276,6 +279,10 @@ void qsa_set_kv_resident(int64_t cells);
 int64_t qsa_kv_resident_min();
 /// Pinned host bytes the streamed states hold (their host copies).
 uint64_t qsa_kv_host_bytes();
+/// Shared demand-allocated 132 MiB THP slab pool for streamed INT8 QSA layers.
+HostKvPool& qsa_host_kv_pool();
+/// Ensures `st`'s streamed host pages covering `[cell_lo, cell_hi)` are allocated and COW-unshared (`refcount == 1`).
+bool qsa_host_kv_ensure(QsaState& st, int64_t cell_lo, int64_t cell_hi, std::string& err, void* stream = nullptr);
 /// Store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and initializing the
 /// session; default off.
 void qsa_set_kv_int8(bool enabled);

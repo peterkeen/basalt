@@ -78,7 +78,7 @@ __device__ __forceinline__ void rope_row(float* row, int pos, int d, const RopeA
 // kv_q8.cu's kv_append_q8_kernel for one row of one KV head: thread d holds value d; groups of 64 are warp pairs
 __device__ __forceinline__ void append_q8_row(float x, int d, long long pos, int h, int n_kv_heads, int page_size,
                                               const int32_t* table, int8_t* codes, uint16_t* scales, int8_t* host_codes,
-                                              uint16_t* host_scales, float* wmax) {
+                                              uint16_t* host_scales, HostKvPage* hp, bool is_v, float* wmax) {
     const int groups = HD / KV_Q8_GROUP, g = d / KV_Q8_GROUP, t = d % KV_Q8_GROUP;
     float a = abs_ieee(x);
     for (int o = 16; o > 0; o >>= 1) a = max_ieee(a, __shfl_xor_sync(0xffffffffu, a, o));
@@ -98,7 +98,11 @@ __device__ __forceinline__ void append_q8_row(float x, int d, long long pos, int
         codes[row * HD + g * KV_Q8_GROUP + t] = (int8_t) q;
         if (t == 0) scales[row * groups + g] = sbits;
     }
-    if (host_codes != nullptr) {
+    if (hp != nullptr) {
+        const long long lrow = (long long) h * page_size + (pos % page_size);
+        (is_v ? hp->v_q : hp->k_q)[lrow * HD + g * KV_Q8_GROUP + t] = (int8_t) q;
+        if (t == 0) (is_v ? hp->v_scale : hp->k_scale)[lrow * groups + g] = sbits;
+    } else if (host_codes != nullptr) {
         const long long row = ((pos / page_size) * n_kv_heads + h) * page_size + (pos % page_size);
         host_codes[row * HD + g * KV_Q8_GROUP + t] = (int8_t) q;
         if (t == 0) host_scales[row * groups + g] = sbits;
@@ -179,9 +183,10 @@ __device__ __forceinline__ void kv_post_dev(const QsaDecKvPost& a, int n, int n_
         rope_row<TAB>(row, a.pos_k[t * (a.pos_stride > 0 ? a.pos_stride : n_kv) + h], d, ra);
         const float y = row[d];
         kp[d] = y;
-        append_q8_row(y, d, pos, h, n_kv, page_size, a.page_table, a.k_q, a.k_scale, a.host.k_q, a.host.k_scale, sums);
+        HostKvPage* hp = a.host.paged.at(pos / page_size);
+        append_q8_row(y, d, pos, h, n_kv, page_size, a.page_table, a.k_q, a.k_scale, a.host.k_q, a.host.k_scale, hp, false, sums);
         const float v = a.vcur[((size_t) t * n_kv + h) * HD + d];
-        append_q8_row(v, d, pos, h, n_kv, page_size, a.page_table, a.v_q, a.v_scale, a.host.v_q, a.host.v_scale, sums);
+        append_q8_row(v, d, pos, h, n_kv, page_size, a.page_table, a.v_q, a.v_scale, a.host.v_q, a.host.v_scale, hp, true, sums);
         return;
     }
     if (a.tail_snap != nullptr)

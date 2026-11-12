@@ -187,7 +187,81 @@ __device__ void copy_misses(const KvStreamMap& m, const Runs& r, int blk, int nb
     }
 }
 
+// Interleaved 4-cell INT8 page copy (4,224 B = 264 x uint4): one contiguous PCIe burst per missed block.
+__device__ void copy_one_page_h2d(const HostKvPage* hp, const QsaAttnPools& slots, long long sl, int codes_b, int scales_b) {
+    const uint4* src = reinterpret_cast<const uint4*>(hp);
+    uint4* dk = reinterpret_cast<uint4*>((uint8_t*) slots.k_q + sl * codes_b);
+    uint4* dv = reinterpret_cast<uint4*>((uint8_t*) slots.v_q + sl * codes_b);
+    uint4* dks = reinterpret_cast<uint4*>((uint8_t*) slots.k_scale + sl * scales_b);
+    uint4* dvs = reinterpret_cast<uint4*>((uint8_t*) slots.v_scale + sl * scales_b);
+    const int nc = codes_b / 16, ns = scales_b / 16;
+    for (int i = threadIdx.x; i < nc; i += blockDim.x) dk[i] = src[i];
+    for (int i = threadIdx.x; i < nc; i += blockDim.x) dv[i] = src[nc + i];
+    for (int i = threadIdx.x; i < 2 * ns; i += blockDim.x) {
+        const uint4 w = src[2 * nc + i];
+        if (i < ns) dks[i] = w;
+        else dvs[i - ns] = w;
+    }
+}
+
+__device__ void copy_misses_paged(const KvStreamMap& m, const QsaAttnPools& slots, const HostKvView& paged,
+                                  int codes_b, int scales_b, int blk, int nblk) {
+    const int need = m.ctl[2];
+    for (int k = blk; k < need; k += nblk) {
+        const long long b = m.miss_block[k], sl = m.miss_slot[k];
+        const HostKvPage* hp = paged.at(b);
+        if (hp != nullptr) copy_one_page_h2d(hp, slots, sl, codes_b, scales_b);
+    }
+}
+
 __global__ void copy_kernel(KvStreamMap m, Runs r) { copy_misses(m, r, blockIdx.x, gridDim.x); }
+
+__global__ void copy_paged_kernel(KvStreamMap m, QsaAttnPools slots, HostKvView paged, int codes_b, int scales_b) {
+    copy_misses_paged(m, slots, paged, codes_b, scales_b, blockIdx.x, gridDim.x);
+}
+
+__global__ void stage_from_paged_kernel(QsaAttnPools stage, HostKvView paged, long long n_blocks, int codes_b, int scales_b) {
+    for (long long b = blockIdx.x; b < n_blocks; b += gridDim.x) {
+        const HostKvPage* hp = paged.at(b);
+        if (hp != nullptr) copy_one_page_h2d(hp, stage, b, codes_b, scales_b);
+    }
+}
+
+__global__ void scatter_to_paged_kernel(QsaAttnPools vram, HostKvView paged, long long n_blocks, int codes_b, int scales_b) {
+    const int nc = codes_b / 16, ns = scales_b / 16;
+    for (long long b = blockIdx.x; b < n_blocks; b += gridDim.x) {
+        HostKvPage* hp = paged.at(b);
+        if (hp == nullptr) continue;
+        uint4* dst = reinterpret_cast<uint4*>(hp);
+        const uint4* sk = reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(vram.k_q) + b * codes_b);
+        const uint4* sv = reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(vram.v_q) + b * codes_b);
+        const uint4* sks = reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(vram.k_scale) + b * scales_b);
+        const uint4* svs = reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(vram.v_scale) + b * scales_b);
+        for (int i = threadIdx.x; i < nc; i += blockDim.x) dst[i] = sk[i];
+        for (int i = threadIdx.x; i < nc; i += blockDim.x) dst[nc + i] = sv[i];
+        for (int i = threadIdx.x; i < 2 * ns; i += blockDim.x) dst[2 * nc + i] = i < ns ? sks[i] : svs[i - ns];
+    }
+}
+
+__global__ void warm_recent_kernel(KvStreamMap m, long long b0, long long warm) {
+    const long long i0 = (long long) blockIdx.x * blockDim.x + threadIdx.x, st = (long long) gridDim.x * blockDim.x;
+    for (long long i = i0; i < m.n_blocks; i += st)
+        m.page_table[i] = (i >= b0 && i < b0 + warm) ? (int32_t) (i - b0) : -1;
+    for (long long i = i0; i < m.n_slots; i += st) {
+        if (i < warm) {
+            m.slot_block[i] = (int32_t) (b0 + i);
+            m.slot_stamp[i] = 1;
+            m.slot_ref[i] = 1;
+        } else {
+            m.slot_block[i] = -1;
+            m.slot_stamp[i] = -1;
+            m.slot_ref[i] = 0;
+        }
+    }
+    if (i0 < kKvCtlInts) {
+        m.ctl[i0] = i0 == 0 ? (warm > 0 ? 1 : 0) : i0 == 1 ? (int32_t) (warm % m.n_slots) : 0;
+    }
+}
 
 // Block j: segment j's rows resolve into its slot's map.  A segment without a slot or rows, or a resident slot (null
 // map), does nothing.  The segments name distinct slots, so no two blocks touch one map.
@@ -207,6 +281,12 @@ __global__ void copy_seg_kernel(QsaSegTable t, QsaShapes s) {
     if (sg.slot < 0 || sg.len <= 0) return;
     const QsaSegSlot& sl = t.slots[sg.slot];
     if (sl.map.ctl == nullptr) return;
+    if (sl.host.paged.slabs != nullptr) {
+        const int rows = (int) (s.n_head_kv * s.page_size);
+        copy_misses_paged(sl.map, sl.pools(), sl.host.paged, rows * (int) s.head_dim,
+                          rows * (int) (s.head_dim / KV_Q8_GROUP) * 2, blockIdx.x, gridDim.x);
+        return;
+    }
     copy_misses(sl.map, runs_int8(sl.pools(), sl.host, s), blockIdx.x, gridDim.x);
 }
 
@@ -259,7 +339,13 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     }
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
-    copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
+    if (fmt == kKvInt8 && host.paged.present()) {
+        const int rows = (int) (s.n_head_kv * s.page_size);
+        copy_paged_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(
+            m, slots, host.paged, rows * (int) s.head_dim, rows * (int) (s.head_dim / KV_Q8_GROUP) * 2);
+    } else {
+        copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
+    }
     check("copy");
 }
 
@@ -312,11 +398,49 @@ void kv_ring_save(const QsaAttnPools& slots, const KvHostPools& host, int fmt, i
 void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t n_blocks,
                         const QsaShapes& s, void* stream) {
     if (n_blocks <= 0) return;
+    if (fmt == kKvInt8 && host.paged.present()) {
+        const int rows = (int) (s.n_head_kv * s.page_size);
+        const unsigned grid = (unsigned) std::min<int64_t>(n_blocks, 1024);
+        stage_from_paged_kernel<<<grid, 128, 0, (cudaStream_t) stream>>>(
+            stage, host.paged, n_blocks, rows * (int) s.head_dim, rows * (int) (s.head_dim / KV_Q8_GROUP) * 2);
+        check("stage paged");
+        return;
+    }
     const Runs r = runs_of(stage, host, fmt, s);
     for (int a = 0; a < r.n; ++a)
         if (cudaMemcpyAsync(r.dst[a], r.src[a], (size_t) (n_blocks * r.len[a]), cudaMemcpyDefault,
                             (cudaStream_t) stream) != cudaSuccess)
             check("stage");
+}
+
+void kv_scatter_to_host_paged(const QsaAttnPools& vram, const HostKvView& paged, int64_t n_blocks,
+                              const QsaShapes& s, void* stream) {
+    if (n_blocks <= 0 || !paged.present()) return;
+    const int rows = (int) (s.n_head_kv * s.page_size);
+    const unsigned grid = (unsigned) std::min<int64_t>(n_blocks, 1024);
+    scatter_to_paged_kernel<<<grid, 128, 0, (cudaStream_t) stream>>>(
+        vram, paged, n_blocks, rows * (int) s.head_dim, rows * (int) (s.head_dim / KV_Q8_GROUP) * 2);
+    check("scatter paged");
+}
+
+void kv_stream_warm_recent(const KvStreamMap& m, const QsaAttnPools& vram, int64_t total_blocks,
+                           const QsaShapes& s, void* stream) {
+    const int64_t warm = std::clamp<int64_t>(total_blocks, 0, m.n_slots);
+    const int64_t b0 = total_blocks - warm;
+    cudaStream_t cs = (cudaStream_t) stream;
+    if (b0 > 0 && warm > 0) {
+        const size_t rows = (size_t) (s.n_head_kv * s.page_size);
+        const size_t codes_b = rows * (size_t) s.head_dim;
+        const size_t scales_b = rows * (size_t) (s.head_dim / KV_Q8_GROUP) * 2;
+        uint8_t* arr[4] = {(uint8_t*) vram.k_q, (uint8_t*) vram.v_q, (uint8_t*) vram.k_scale, (uint8_t*) vram.v_scale};
+        const size_t len[4] = {codes_b, codes_b, scales_b, scales_b};
+        for (int a = 0; a < 4; ++a)
+            if (cudaMemcpyAsync(arr[a], arr[a] + (size_t) b0 * len[a], (size_t) warm * len[a],
+                                cudaMemcpyDeviceToDevice, cs) != cudaSuccess)
+                check("warm d2d");
+    }
+    warm_recent_kernel<<<128, 256, 0, cs>>>(m, b0, warm);
+    check("warm map");
 }
 
 KvStreamCounters kv_stream_counters(const KvStreamMap& m) {

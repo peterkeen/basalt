@@ -118,6 +118,8 @@ bool session_kv_map(SessionState& s, int64_t cells, std::string& err);
 bool session_kv_unmap(SessionState& s, int64_t cells, std::string& err);
 /// Unmaps only the K/V arenas past `kv_cells`, keeping `idx_arena` (pooled keys + RoPE) mapped.
 bool session_kv_only_unmap(SessionState& s, int64_t kv_cells, std::string& err);
+/// Ensures streamed `HostKvPool` pages covering `[cell_lo, cell_hi)` are allocated and COW-unshared across `s`.
+bool session_host_kv_ensure(SessionState& s, int64_t cell_lo, int64_t cell_hi, std::string& err, void* stream = nullptr);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);

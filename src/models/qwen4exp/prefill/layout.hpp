@@ -83,7 +83,7 @@ struct Fp4Ptrs {
 const MmqPlan& mmq_plan();
 float* grp_scales(uint8_t* grp_d);
 void take_stage(Alloc& o, const core::SessionState& ss, const basalt::kernels::QsaShapes& s,
-                basalt::kernels::KvHostPools& st, bool& ok);
+                basalt::kernels::KvHostPools& st, bool& ok, int64_t stage_cells = 0);
 basalt::kernels::QsaAttnPools pools_of(const basalt::kernels::KvHostPools& h, const int32_t* table);
 uint64_t gdn_qkv_bytes(size_t T);
 uint64_t gdn_set_bytes(size_t T);

@@ -27,8 +27,39 @@
 
 namespace basalt::kernels {
 
-/// The host copy of one layer's K/V: device-mapped pointers (UVA) into pinned memory, identity layout
-/// `[block][kv_head][page_size][head_dim]`. All null when the layer is fully resident.
+/// Interleaved 4-cell INT8 QSA KV block in pinned host RAM (2 KV heads x 4 cells x 256 values + FP16 scales per 64).
+/// 4,224 B exact (264 x uint4, 128-byte aligned inside a 2 MiB-aligned slab).
+struct alignas(16) HostKvPage {
+    int8_t   k_q[2 * 4 * 256];      ///< 2,048 B
+    int8_t   v_q[2 * 4 * 256];      ///< 2,048 B
+    uint16_t k_scale[2 * 4 * 4];    ///<    64 B
+    uint16_t v_scale[2 * 4 * 4];    ///<    64 B
+};
+static_assert(sizeof(HostKvPage) == 4224, "HostKvPage size");
+
+inline constexpr int kHostKvSlabShift = 15;
+inline constexpr int64_t kHostKvSlabPages = 1ll << kHostKvSlabShift;   ///< 32,768 pages = 132 MiB exact
+inline constexpr int64_t kHostKvSlabMask = kHostKvSlabPages - 1;       ///< 0x7FFF
+
+/// Device view of one QSA layer's paged INT8 host KV pool (null when resident or using contiguous KvHostPools).
+struct HostKvView {
+    uint8_t* const* slabs = nullptr;      ///< device directory of mapped slab pointers
+    const int32_t*  page_table = nullptr; ///< logical 4-cell block -> physical page (-1: unallocated)
+#ifdef __CUDACC__
+    __device__ __forceinline__ HostKvPage* at(long long block) const {
+        if (slabs == nullptr || page_table == nullptr) return nullptr;
+        const int32_t p = page_table[block];
+        if (p < 0) return nullptr;
+        uint8_t* const base = slabs[p >> kHostKvSlabShift];
+        return base == nullptr ? nullptr
+                               : reinterpret_cast<HostKvPage*>(base + (long long) (p & kHostKvSlabMask) * 4224ll);
+    }
+#endif
+    bool present() const { return slabs != nullptr && page_table != nullptr; }
+};
+
+/// The host copy of one layer's K/V: either a shared paged INT8 pool (`paged`), or contiguous device-mapped pointers
+/// (UVA) into pinned memory in identity layout `[block][kv_head][page_size][head_dim]`. All null when resident.
 struct KvHostPools {
     uint16_t* k_pool = nullptr;   ///< fp16 mode
     uint16_t* v_pool = nullptr;
@@ -38,7 +69,8 @@ struct KvHostPools {
     uint16_t* v_scale = nullptr;
     uint8_t* k_q4 = nullptr;      ///< q4_0 mode (kv_q4.hpp): block_q4_0 codes, 144 B per cell and head
     uint8_t* v_q4 = nullptr;
-    bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
+    HostKvView paged;             ///< demand-allocated paged INT8 slabs (takes precedence when present)
+    bool present() const { return paged.present() || k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
 };
 
 /// The KV storage format, for the functions below that move whole blocks (`fmt`): fp16, int8 (+ scales), q4_0.
@@ -88,9 +120,18 @@ void kv_ring_save(const QsaAttnPools& slots, const KvHostPools& host, int fmt, i
                   const QsaShapes& s, void* stream);
 
 /// Copy the first `n_blocks` blocks of the host copy into a fully resident (identity-layout) pool: the prompt
-/// path's staging of one layer. Not capturable (DMA).
+/// path's staging of one layer, or a promotion back to VRAM. Not capturable (DMA / gather).
 void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t n_blocks,
                         const QsaShapes& s, void* stream);
+
+/// Scatter the first `n_blocks` blocks of a resident identity-layout INT8 VRAM pool into `paged` host pages.
+void kv_scatter_to_host_paged(const QsaAttnPools& vram, const HostKvView& paged, int64_t n_blocks,
+                              const QsaShapes& s, void* stream);
+
+/// Pre-warm `m` with the latest `min(total_blocks, m.n_slots)` blocks of `vram` (copying `[total_blocks - warm,
+/// total_blocks)` into slots `[0, warm)` before `vram` unmaps its tail) so streaming decode starts with a warm cache.
+void kv_stream_warm_recent(const KvStreamMap& m, const QsaAttnPools& vram, int64_t total_blocks,
+                           const QsaShapes& s, void* stream);
 
 struct KvStreamCounters {
     uint64_t misses = 0, lookups = 0, calls = 0;

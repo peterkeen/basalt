@@ -239,6 +239,12 @@ bool session_kv_only_unmap(SessionState& s, int64_t kv_cells, std::string& err) 
     return true;
 }
 
+bool session_host_kv_ensure(SessionState& s, int64_t cell_lo, int64_t cell_hi, std::string& err, void* stream) {
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        if (!qsa_host_kv_ensure(s.qsa_states[s.qsa_ord0 + j], cell_lo, cell_hi, err, stream)) return false;
+    return true;
+}
+
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
     cudaStream_t cs = (cudaStream_t) stream;
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the

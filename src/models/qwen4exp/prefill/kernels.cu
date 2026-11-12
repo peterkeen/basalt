@@ -591,7 +591,13 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
         (is_v ? v_q : k_q)[row * 256 + d] = (int8_t) q;
         if (threadIdx.x == 0) (is_v ? v_scale : k_scale)[row * 4 + g] = sb;
     }
-    if (host.k_q != nullptr) {
+    if (host.paged.slabs != nullptr) {
+        if (basalt::kernels::HostKvPage* hp = host.paged.at(pos / page_size)) {
+            const int64_t lrow = (int64_t) kvh * page_size + pos % page_size;
+            (is_v ? hp->v_q : hp->k_q)[lrow * 256 + d] = (int8_t) q;
+            if (threadIdx.x == 0) (is_v ? hp->v_scale : hp->k_scale)[lrow * 4 + g] = sb;
+        }
+    } else if (host.k_q != nullptr) {
         (is_v ? host.v_q : host.k_q)[row_id * 256 + d] = (int8_t) q;
         if (threadIdx.x == 0) (is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
     }

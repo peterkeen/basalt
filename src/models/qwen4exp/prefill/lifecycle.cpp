@@ -54,6 +54,7 @@ void Prefill::release() {
 }
 
 void Prefill::set_session(core::SessionState& ss) { impl_->ss = &ss; }
+void Prefill::set_stage_cells(int64_t cells) { impl_->stage_cells = std::max<int64_t>(cells, 0); }
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
@@ -151,15 +152,17 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         for (int b = 0; b < 2; ++b) m.ahead_slot[b].assign((size_t) m.g->n_expert, -1);
     }
-    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
+    if (g.n_qsa_layers() > 0 && m.ident_table == nullptr) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
-        std::vector<int32_t> ident((size_t) pages);
-        for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
-        if (cudaMalloc((void**) &m.ident_table, ident.size() * 4) != cudaSuccess ||
-            cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
-            ok = false;
-        else
-            m.owned.push_back(m.ident_table);
+        if (pages > 0) {
+            std::vector<int32_t> ident((size_t) pages);
+            for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
+            if (cudaMalloc((void**) &m.ident_table, ident.size() * 4) != cudaSuccess ||
+                cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+                ok = false;
+            else
+                m.owned.push_back(m.ident_table);
+        }
     }
     if (!ok) { err = "prefill: host buffers or events for a chunk of " + std::to_string(chunk) + " tokens"; return false; }
     Alloc o;

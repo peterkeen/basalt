@@ -459,7 +459,28 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
 
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
 int64_t qsa_kv_resident_min() { return 20480; }
-uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
+HostKvPool& qsa_host_kv_pool() {
+    static HostKvPool pool(true);
+    return pool;
+}
+uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes + qsa_host_kv_pool().pinned_bytes(); }
+
+bool qsa_host_kv_ensure(QsaState& st, int64_t cell_lo, int64_t cell_hi, std::string& err, void* stream) {
+    if (st.kv_mode != 1 || st.host_pool == nullptr || cell_hi <= cell_lo) return true;
+    const int64_t page_size = basalt::kernels::qsa_real_shapes().page_size;
+    const int64_t page_lo = std::max<int64_t>(0, cell_lo / page_size);
+    const int64_t exact_hi = std::min<int64_t>((int64_t) st.host_tab.h_pages.size(), (cell_hi + page_size - 1) / page_size);
+    if (exact_hi <= page_lo) return true;
+    if (page_lo >= st.host_tab.writable_lo && exact_hi <= st.host_tab.writable_hi) return true;
+    // Batch decode growth in 4,096-cell (1,024-page) steps to avoid per-window table uploads; fall back to exact_hi near RAM limits.
+    const int64_t step_pages = 1024;
+    const int64_t ahead_hi = (cell_hi - cell_lo <= 64)
+        ? std::min<int64_t>((int64_t) st.host_tab.h_pages.size(), ((exact_hi + step_pages - 1) / step_pages) * step_pages)
+        : exact_hi;
+    if (ahead_hi > exact_hi && st.host_pool->ensure_writable(st.host_tab, page_lo, ahead_hi, err, stream)) return true;
+    err.clear();
+    return st.host_pool->ensure_writable(st.host_tab, page_lo, exact_hi, err, stream);
+}
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
@@ -467,10 +488,12 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     uint64_t n = 0;
     const bool elastic = kv_elastic_state(s, p);   // elastic: pools, pooled keys and rope live in their own ranges
     const int64_t map_slots = p.mode == 1 ? p.slots : elastic_stream_slots(s, p, ring_cells);
+    const bool host_tab = ring_cells == 0 && (p.mode == 1 || elastic);
     if (!elastic)
         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
                            g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
+    if (host_tab) n += (uint64_t) p.pages * 4 + 16;                            // host_page_table
     if (map_slots > 0) n += basalt::kernels::kv_stream_map_bytes(map_slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
@@ -590,6 +613,18 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.v_pool = c.take<uint16_t>(rows * s.head_dim);
     }
     st.page_table = c.take<int32_t>((uint64_t) pages);
+    st.host_pool = nullptr;
+    st.host_tab = HostKvTable{};
+    const bool can_page_host = ring_cells == 0 && (p.mode == 1 || kv_elastic_state(s, p));
+    if (can_page_host) {
+        st.host_tab.d_pages = c.take<int32_t>((uint64_t) pages);
+        if (st.kv_int8 && !st.kv_rot && !st.kv_hybrid) {
+            cudaGetDevice(&st.host_tab.device);
+            st.host_pool = &qsa_host_kv_pool();
+            st.host_tab.h_pages.assign((size_t) pages, -1);
+            cudaMemset(st.host_tab.d_pages, 0xff, (size_t) pages * sizeof(int32_t));
+        }
+    }
     st.n_pages = pages;
     st.max_cells = max_cells;
     const int64_t map_slots = p.mode == 1 ? p.slots : elastic_stream_slots(s, p, ring_cells);
@@ -626,10 +661,14 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             cudaSuccess) {
         return 0;   // the caller sees a zero byte count; a half-built state is worse than none
     }
-    // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout.
-    // A draft ring without --kv-resident keeps only its VRAM ring pages (no pinned host mirror).
+    // KV streaming: INT8 main layers use the shared demand-allocated `HostKvPool` (0 MiB pinned at startup);
+    // FP16/Q4_0 layers and `--kv-resident` draft rings keep their contiguous pinned identity buffer.
     st.host = basalt::kernels::KvHostPools{};
-    if (p.mode == 1 || (p.mode == 2 && g_kv_resident > 0)) {
+    if (p.mode == 1 && st.host_pool != nullptr) {
+        uint8_t* const* d_slabs = st.host_pool->device_slabs(st.host_tab.device);
+        if (d_slabs == nullptr) return 0;
+        st.host.paged = {d_slabs, st.host_tab.d_pages};
+    } else if (p.mode == 1 || (p.mode == 2 && g_kv_resident > 0)) {
         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
         const uint64_t bytes = (uint64_t) pages * basalt::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
@@ -693,6 +732,11 @@ void qsa_set_kv_elastic(int64_t floor_cells) { g_kv_elastic = floor_cells > 0 ? 
 int64_t qsa_kv_elastic() { return g_kv_elastic; }
 
 void qsa_state_release(QsaState& st) {
+    if (st.host_pool != nullptr) {
+        st.host_pool->release_table(st.host_tab);
+        st.host_pool = nullptr;
+    }
+    st.host.paged = {};
     delete st.kv_arena;
     st.kv_arena = nullptr;
     delete st.idx_arena;
@@ -721,10 +765,15 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
         cudaMemsetAsync(st.k_pool, 0, rows * s.head_dim * 2, cs);
         cudaMemsetAsync(st.v_pool, 0, rows * s.head_dim * 2, cs);
     }
-    // A streamed state starts over with nothing resident. Its host copy is not cleared (GBs over PCIe per new
-    // conversation): no reader names a cell before this sequence has written it, and a block copied in whole
-    // carries the unwritten cells past the end, which nothing reads.
-    if (st.kv_mode == 1) basalt::kernels::kv_stream_reset(st.map, stream);
+    // A streamed state starts over with nothing resident; paged host blocks from an earlier sequence are released back
+    // to the shared pool (keeping one spare slab warm).
+    if (st.kv_mode == 1) {
+        basalt::kernels::kv_stream_reset(st.map, stream);
+        if (st.host_pool != nullptr) {
+            cudaStreamSynchronize(cs);
+            st.host_pool->release_range(const_cast<HostKvTable&>(st.host_tab), 0, /*keep_spare=*/true, stream);
+        }
+    }
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     // elastic: the pooled rows of the backed pages and the spare rows past them (mapping more zeroes the rest)
@@ -819,25 +868,50 @@ bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometr
     const uint64_t q4 = pr * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     // a streamed state's cells are its host copy, which has the identity layout of a whole pool
     const bool dh = dst.kv_mode == 1, sh = src.kv_mode == 1;
-    struct Arr { void* d; const void* s; uint64_t page; };
-    std::vector<Arr> arrs;
-    if (src.kv_hybrid) arrs = {{dst.k_q, src.k_q, code}, {dst.k_scale, src.k_scale, scale}, {dst.v_q4, src.v_q4, q4}};
-    else if (src.kv_q4)
-        arrs = {{dh ? dst.host.k_q4 : dst.k_q4, sh ? src.host.k_q4 : src.k_q4, q4},
-                {dh ? dst.host.v_q4 : dst.v_q4, sh ? src.host.v_q4 : src.v_q4, q4}};
-    else if (src.kv_int8)
-        arrs = {{dh ? dst.host.k_q : dst.k_q, sh ? src.host.k_q : src.k_q, code},
-                {dh ? dst.host.v_q : dst.v_q, sh ? src.host.v_q : src.v_q, code},
-                {dh ? dst.host.k_scale : dst.k_scale, sh ? src.host.k_scale : src.k_scale, scale},
-                {dh ? dst.host.v_scale : dst.v_scale, sh ? src.host.v_scale : src.v_scale, scale}};
-    else
-        arrs = {{dh ? dst.host.k_pool : dst.k_pool, sh ? src.host.k_pool : src.k_pool, code * 2},
-                {dh ? dst.host.v_pool : dst.v_pool, sh ? src.host.v_pool : src.v_pool, code * 2}};
+    const bool dp = dh && dst.host.paged.present() && dst.host_pool != nullptr;
+    const bool sp = sh && src.host.paged.present() && src.host_pool != nullptr;
     const int64_t p0 = cell0 / s.page_size, p1 = (cell1 + s.page_size - 1) / s.page_size;
     bool ok = true;
-    for (const Arr& a : arrs)
-        ok = ok && copy((uint8_t*) a.d + (size_t) p0 * a.page, (const uint8_t*) a.s + (size_t) p0 * a.page,
-                        (uint64_t) (p1 - p0) * a.page);
+    if (dp && !dst.host_pool->ensure_writable(dst.host_tab, p0, p1, err)) return false;
+    if (dp || sp) {
+        for (int64_t p = p0; ok && p < p1; ++p) {
+            basalt::kernels::HostKvPage* dhp = dp ? dst.host_pool->page_ptr(dst.host_tab.h_pages[(size_t) p]) : nullptr;
+            const basalt::kernels::HostKvPage* shp =
+                sp ? src.host_pool->page_ptr(src.host_tab.h_pages[(size_t) p]) : nullptr;
+            if ((dp && dhp == nullptr) || (sp && shp == nullptr)) {
+                err = "a QSA state copy met an unallocated host KV page";
+                return false;
+            }
+            void* dk[4] = {dp ? (void*) dhp->k_q : (dh ? (uint8_t*) dst.host.k_q + (size_t) p * code : (uint8_t*) dst.k_q + (size_t) p * code),
+                           dp ? (void*) dhp->v_q : (dh ? (uint8_t*) dst.host.v_q + (size_t) p * code : (uint8_t*) dst.v_q + (size_t) p * code),
+                           dp ? (void*) dhp->k_scale : (dh ? (uint8_t*) dst.host.k_scale + (size_t) p * scale : (uint8_t*) dst.k_scale + (size_t) p * scale),
+                           dp ? (void*) dhp->v_scale : (dh ? (uint8_t*) dst.host.v_scale + (size_t) p * scale : (uint8_t*) dst.v_scale + (size_t) p * scale)};
+            const void* sk[4] = {sp ? (const void*) shp->k_q : (sh ? (const uint8_t*) src.host.k_q + (size_t) p * code : (const uint8_t*) src.k_q + (size_t) p * code),
+                                 sp ? (const void*) shp->v_q : (sh ? (const uint8_t*) src.host.v_q + (size_t) p * code : (const uint8_t*) src.v_q + (size_t) p * code),
+                                 sp ? (const void*) shp->k_scale : (sh ? (const uint8_t*) src.host.k_scale + (size_t) p * scale : (const uint8_t*) src.k_scale + (size_t) p * scale),
+                                 sp ? (const void*) shp->v_scale : (sh ? (const uint8_t*) src.host.v_scale + (size_t) p * scale : (const uint8_t*) src.v_scale + (size_t) p * scale)};
+            const uint64_t lens[4] = {code, code, scale, scale};
+            for (int a = 0; a < 4; ++a) ok = ok && copy(dk[a], sk[a], lens[a]);
+        }
+    } else {
+        struct Arr { void* d; const void* s; uint64_t page; };
+        std::vector<Arr> arrs;
+        if (src.kv_hybrid) arrs = {{dst.k_q, src.k_q, code}, {dst.k_scale, src.k_scale, scale}, {dst.v_q4, src.v_q4, q4}};
+        else if (src.kv_q4)
+            arrs = {{dh ? dst.host.k_q4 : dst.k_q4, sh ? src.host.k_q4 : src.k_q4, q4},
+                    {dh ? dst.host.v_q4 : dst.v_q4, sh ? src.host.v_q4 : src.v_q4, q4}};
+        else if (src.kv_int8)
+            arrs = {{dh ? dst.host.k_q : dst.k_q, sh ? src.host.k_q : src.k_q, code},
+                    {dh ? dst.host.v_q : dst.v_q, sh ? src.host.v_q : src.v_q, code},
+                    {dh ? dst.host.k_scale : dst.k_scale, sh ? src.host.k_scale : src.k_scale, scale},
+                    {dh ? dst.host.v_scale : dst.v_scale, sh ? src.host.v_scale : src.v_scale, scale}};
+        else
+            arrs = {{dh ? dst.host.k_pool : dst.k_pool, sh ? src.host.k_pool : src.k_pool, code * 2},
+                    {dh ? dst.host.v_pool : dst.v_pool, sh ? src.host.v_pool : src.v_pool, code * 2}};
+        for (const Arr& a : arrs)
+            ok = ok && copy((uint8_t*) a.d + (size_t) p0 * a.page, (const uint8_t*) a.s + (size_t) p0 * a.page,
+                            (uint64_t) (p1 - p0) * a.page);
+    }
     // the pooled keys of the blocks the cells reach and the spare row after them, the tail, the spare, the block position
     const uint64_t row = (uint64_t) s.idx_dim * 4;
     const int64_t r0 = cell0 / s.idx_block;
@@ -985,6 +1059,7 @@ const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, 
 // ---- resolve every tensor by name, and REFUSE rather than reading a null.  `check_all` has already
 // asserted the shapes at engine start; a missing name here is a wiring mistake.
 struct Req { const char* suf; };    const WeightRef* w_idxk = v.get("indexer.k_proj.weight");    const WeightRef* w_attnq = v.get("attn_q.weight");    const WeightRef* w_attnk = v.get("attn_k.weight");    const WeightRef* w_attnv = v.get("attn_v.weight");    const WeightRef* w_attno = v.get("attn_output.weight");    const WeightRef* w_idxq = v.get("indexer.q_proj.weight");    const WeightRef* w_qn = v.get("attn_q_norm.weight");    const WeightRef* w_kn = v.get("attn_k_norm.weight");    const WeightRef* w_iqn = v.get("indexer.q_norm.weight");    const WeightRef* w_ikn = v.get("indexer.k_norm.weight");    const char* missing = !w_idxk ? "indexer.k_proj.weight" : !w_attnq ? "attn_q.weight"                          : !w_attnk ? "attn_k.weight" : !w_attnv ? "attn_v.weight"                          : !w_attno ? "attn_output.weight" : !w_idxq ? "indexer.q_proj.weight"                          : !w_qn ? "attn_q_norm.weight" : !w_kn ? "attn_k_norm.weight"                          : !w_iqn ? "indexer.q_norm.weight" : !w_ikn ? "indexer.k_norm.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }    if (pos < 0 || pos >= st.max_cells) {        err = "qsa_layer: pos " + std::to_string(pos) + " is outside the state's 0.." +              std::to_string(st.max_cells - 1);        return false;    }
+    if (!qsa_host_kv_ensure(const_cast<QsaState&>(st), pos, pos + 1, err, stream)) return false;
 // THE TWO BF16 PROJECTIONS: the arena holds them re-rounded to 2 B/elem, which is what `bf16_gemv` wants.  Reading one
 // as f32 would walk 2x its length inside the arena without faulting.
 if (w_idxk->kind != WeightKind::Bf16InF32 || w_idxq->kind != WeightKind::Bf16InF32) {        err = v.name("indexer.*_proj.weight") + " must be engine form 1 (bf16); they are " +              std::to_string((int) w_idxk->kind) + " and " + std::to_string((int) w_idxq->kind);        return false;    }

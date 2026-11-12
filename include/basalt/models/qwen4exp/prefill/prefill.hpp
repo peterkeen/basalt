@@ -81,6 +81,8 @@ public:
     /// Points the prompt path at another session's state (a view of `ss` with a batch slot's state fields) for the
     /// next runs; the buffers and the layer range stay.
     void set_session(core::SessionState& ss);
+    /// Bounds the streamed staging pool `m.stage` to `cells` cells (0: the session's full context) on the next relayout.
+    void set_stage_cells(int64_t cells);
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all); sizes the prompt path's
     /// lend cap.
@@ -98,7 +100,8 @@ public:
     static double pinned_share();
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
-    static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
+    static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                 int64_t stage_cells = 0);
 
     /// Lays every buffer of a chunk of `chunk` tokens out over a region of exactly `bytes_needed` bytes without
     /// touching device memory (the pointers are never dereferenced) and reports the bytes the layout took; false when

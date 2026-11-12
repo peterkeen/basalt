@@ -43,7 +43,45 @@ std::vector<uint8_t> get(const void* d, size_t bytes) {
 }
 
 // one QSA array: its bytes (a streamed state's cells: its host copy) and its bytes per KV page (0: not paged)
-struct Arr { const void* p; uint64_t page, bytes; };
+struct Arr { const void* p; uint64_t page, bytes; int paged_idx = -1; const QsaState* st = nullptr; };
+
+std::vector<uint8_t> get_arr(const Arr& a, uint64_t bytes) {
+    if (a.paged_idx >= 0 && a.st != nullptr && a.st->host_pool != nullptr) {
+        std::vector<uint8_t> out((size_t) bytes, 0);
+        const int64_t pages = (int64_t) ((bytes + a.page - 1) / a.page);
+        for (int64_t p = 0; p < pages; ++p) {
+            const int32_t phys = a.st->host_tab.h_pages[(size_t) p];
+            const basalt::kernels::HostKvPage* hp = phys >= 0 ? a.st->host_pool->page_ptr(phys) : nullptr;
+            if (hp == nullptr) continue;
+            const uint8_t* src = a.paged_idx == 0 ? (const uint8_t*) hp->k_q
+                               : a.paged_idx == 1 ? (const uint8_t*) hp->v_q
+                               : a.paged_idx == 2 ? (const uint8_t*) hp->k_scale
+                                                  : (const uint8_t*) hp->v_scale;
+            const size_t off = (size_t) p * a.page;
+            const size_t n = std::min<size_t>((size_t) a.page, (size_t) bytes - off);
+            std::memcpy(out.data() + off, src, n);
+        }
+        return out;
+    }
+    return get(a.p, (size_t) bytes);
+}
+
+void fill_arr(const Arr& a) {
+    if (a.paged_idx >= 0 && a.st != nullptr && a.st->host_pool != nullptr) {
+        std::string err;
+        CHECK(a.st->host_pool->ensure_writable(const_cast<HostKvTable&>(a.st->host_tab), 0, a.st->n_pages, err));
+        for (int64_t p = 0; p < a.st->n_pages; ++p) {
+            basalt::kernels::HostKvPage* hp = a.st->host_pool->page_ptr(a.st->host_tab.h_pages[(size_t) p]);
+            uint8_t* dst = a.paged_idx == 0 ? (uint8_t*) hp->k_q
+                         : a.paged_idx == 1 ? (uint8_t*) hp->v_q
+                         : a.paged_idx == 2 ? (uint8_t*) hp->k_scale
+                                            : (uint8_t*) hp->v_scale;
+            for (uint64_t i = 0; i < a.page; ++i) dst[i] = (uint8_t) g_rng();
+        }
+        return;
+    }
+    fill(const_cast<void*>(a.p), a.bytes);
+}
 
 std::vector<Arr> arrays(const QsaState& st, const ModelGeometry& g) {
     basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
@@ -53,9 +91,13 @@ std::vector<Arr> arrays(const QsaState& st, const ModelGeometry& g) {
     const uint64_t code = pr * s.head_dim, scale = pr * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2;
     const uint64_t q4 = pr * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     const bool h = st.kv_mode == 1;
+    const bool hp = h && st.host.paged.present() && st.host_pool != nullptr;
     std::vector<Arr> v;
     if (st.kv_hybrid) v = {{st.k_q, code, 0}, {st.k_scale, scale, 0}, {st.v_q4, q4, 0}};
     else if (st.kv_q4) v = {{h ? st.host.k_q4 : st.k_q4, q4, 0}, {h ? st.host.v_q4 : st.v_q4, q4, 0}};
+    else if (st.kv_int8 && hp)
+        v = {{nullptr, code, 0, 0, &st}, {nullptr, code, 0, 1, &st},
+             {nullptr, scale, 0, 2, &st}, {nullptr, scale, 0, 3, &st}};
     else if (st.kv_int8)
         v = {{h ? st.host.k_q : st.k_q, code, 0}, {h ? st.host.v_q : st.v_q, code, 0},
              {h ? st.host.k_scale : st.k_scale, scale, 0}, {h ? st.host.v_scale : st.v_scale, scale, 0}};
@@ -72,7 +114,7 @@ std::vector<Arr> arrays(const QsaState& st, const ModelGeometry& g) {
 void fill_state(const SessionState& s, const ModelGeometry& g, uint64_t gdn_row) {
     fill(s.gdn_state, (size_t) (s.gdn_alloc * (int64_t) gdn_row));
     for (int64_t j = 0; j < s.qsa_alloc; ++j)
-        for (const Arr& a : arrays(s.qsa_states[s.qsa_ord0 + j], g)) fill(const_cast<void*>(a.p), a.bytes);
+        for (const Arr& a : arrays(s.qsa_states[s.qsa_ord0 + j], g)) fill_arr(a);
 }
 
 // [lo, hi) of the bytes of `got` equal `want`'s, the rest `before`'s
@@ -135,7 +177,7 @@ void run_format(const char* name, bool int8, bool q4, bool hybrid, int dst_dev, 
             if (to[i].page > 0)
                 n = i + 4 == to.size() ? std::min<uint64_t>(to[i].bytes, (uint64_t) (a0 / s.idx_block + 2) * to[i].page)
                                        : (uint64_t) ((a0 + s.page_size - 1) / s.page_size) * to[i].page;
-            CHECK(get(to[i].p, n) == get(from[i].p, n));
+            CHECK(get_arr(to[i], n) == get_arr(from[i], n));
         }
     }
     // ---- the stage reads its cells [a0, c1); then they go back, and nothing else of the whole session moves
@@ -144,7 +186,7 @@ void run_format(const char* name, bool int8, bool q4, bool hybrid, int dst_dev, 
     fill_state(ps, g, gdn_row);
     cudaSetDevice(0);
     for (int64_t q = 0; q < g.n_qsa_layers(); ++q)
-        for (const Arr& a : arrays(ss.qsa_states[q], g)) before.push_back(get(a.p, a.bytes));
+        for (const Arr& a : arrays(ss.qsa_states[q], g)) before.push_back(get_arr(a, a.bytes));
     const std::vector<uint8_t> gdn_before = get(ss.gdn_state, ss.gdn_alloc * gdn_row), ple_before = get(ss.ple_hist, z.ple);
     CHECK(session_copy_state(ss, ps, g, lb, g.n_layers, a0, c1, copy_back, err) && back.wait(err));
     CHECK(get(ss.ple_hist, z.ple) == ple_before);   // the range does not reach layer 1: the PLE window stays
@@ -158,12 +200,12 @@ void run_format(const char* name, bool int8, bool q4, bool hybrid, int dst_dev, 
     for (int64_t q = 0; q < g.n_qsa_layers(); ++q) {
         const std::vector<Arr> to = arrays(ss.qsa_states[q], g);
         for (size_t i = 0; i < to.size(); ++i, ++k) {
-            const std::vector<uint8_t> got = get(to[i].p, to[i].bytes);
+            const std::vector<uint8_t> got = get_arr(to[i], to[i].bytes);
             if (q < q0) {
                 CHECK(got == before[k]);
                 continue;
             }
-            const std::vector<uint8_t> want = get(arrays(ps.qsa_states[q], g)[i].p, to[i].bytes);
+            const std::vector<uint8_t> want = get_arr(arrays(ps.qsa_states[q], g)[i], to[i].bytes);
             uint64_t lo = 0, hi = to[i].bytes;
             if (to[i].page > 0 && i + 4 == to.size()) {   // the pooled rows the cells reach and the spare one after
                 lo = (uint64_t) (a0 / s.idx_block) * to[i].page;

@@ -87,6 +87,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    if (!session_host_kv_ensure(ss, pos0, pos0 + T, err, cs_)) return false;
     refresh_ar();
     if (!capture(T, err) || !capture_commit(err)) return false;
     DecodeGaps& gm = decode_gaps();

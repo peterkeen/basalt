@@ -56,6 +56,7 @@ target_link_libraries(model_qwen4exp_kernels PUBLIC kernels)
 add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp src/models/qwen4exp/decode/expert_dispatch.cpp
   src/models/qwen4exp/decode/session.cpp
   src/models/qwen4exp/decode/kv_arena.cpp
+  src/models/qwen4exp/decode/host_kv_pool.cpp
   src/models/qwen4exp/decode/layout.cpp
   src/models/qwen4exp/decode/native_head.cpp
   src/models/qwen4exp/decode/native_dense.cpp

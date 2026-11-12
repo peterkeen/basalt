@@ -59,7 +59,13 @@ __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict
         (is_v ? v_q : k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
         if (t == 0) (is_v ? v_scale : k_scale)[row * groups + g] = sbits;
     }
-    if (host.k_q != nullptr) {
+    if (host.paged.slabs != nullptr) {
+        if (HostKvPage* hp = host.paged.at(pos / page_size)) {
+            const long long lrow = (long long) h * page_size + (pos % page_size);
+            (is_v ? hp->v_q : hp->k_q)[lrow * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
+            if (t == 0) (is_v ? hp->v_scale : hp->k_scale)[lrow * groups + g] = sbits;
+        }
+    } else if (host.k_q != nullptr) {
         const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
         (is_v ? host.v_q : host.k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
         if (t == 0) (is_v ? host.v_scale : host.k_scale)[row * groups + g] = sbits;
