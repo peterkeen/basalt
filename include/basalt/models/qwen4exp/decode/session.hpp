@@ -112,8 +112,12 @@ uint64_t session_kv_grow_bytes(const SessionState& s, int64_t cells);
 uint64_t session_kv_bytes_for(const SessionState& s, int64_t cells);
 /// The VRAM backing the session's elastic KV now (0 when it is not elastic).
 uint64_t session_kv_mapped_bytes(const SessionState& s);
+uint64_t session_kv_only_mapped_bytes(const SessionState& s);
+uint64_t session_kv_only_bytes_for(const SessionState& s, int64_t cells);
 bool session_kv_map(SessionState& s, int64_t cells, std::string& err);
 bool session_kv_unmap(SessionState& s, int64_t cells, std::string& err);
+/// Unmaps only the K/V arenas past `kv_cells`, keeping `idx_arena` (pooled keys + RoPE) mapped.
+bool session_kv_only_unmap(SessionState& s, int64_t kv_cells, std::string& err);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);

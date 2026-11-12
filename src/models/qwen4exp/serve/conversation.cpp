@@ -350,8 +350,11 @@ namespace {
 // the VRAM a session's own QSA layers' K/V maps (the drafter's arena aside)
 uint64_t qsa_kv_mapped(const basalt::core::SessionState& u) {
     uint64_t b = 0;
-    for (int64_t j = 0; u.qsa_states != nullptr && j < u.qsa_alloc; ++j)
-        if (const basalt::core::KvArena* a = u.qsa_states[u.qsa_ord0 + j].kv_arena) b += a->mapped_bytes();
+    for (int64_t j = 0; u.qsa_states != nullptr && j < u.qsa_alloc; ++j) {
+        const basalt::core::QsaState& q = u.qsa_states[u.qsa_ord0 + j];
+        if (q.kv_arena != nullptr) b += q.kv_arena->mapped_bytes();
+        if (q.idx_arena != nullptr) b += q.idx_arena->mapped_bytes();
+    }
     return b;
 }
 }  // namespace
@@ -492,9 +495,11 @@ bool QfnRuntime::park_one(int b, std::string& e) {
     ids.clear();
     imgs.clear();
     cks.clear();
-    for (int64_t j = 0; j < u.qsa_alloc; ++j)
-        if (basalt::core::KvArena* a = u.qsa_states[u.qsa_ord0 + j].kv_arena)
-            if (!a->unmap(kv_floor, e)) { e = "elastic KV: " + e; return false; }
+    for (int64_t j = 0; j < u.qsa_alloc; ++j) {
+        basalt::core::QsaState& q = u.qsa_states[u.qsa_ord0 + j];
+        if (q.kv_arena != nullptr && !q.kv_arena->unmap(kv_floor, e)) { e = "elastic KV: " + e; return false; }
+        if (q.idx_arena != nullptr && !q.idx_arena->unmap(kv_floor, e)) { e = "elastic KV: " + e; return false; }
+    }
     ++kv_moves;
     char where[64];
     if (to_ram) std::snprintf(where, sizeof where, "to RAM (%.0f MiB)", (double) bytes / 1048576.0);

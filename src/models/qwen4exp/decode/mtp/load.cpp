@@ -141,6 +141,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     qsa_set_kv_hybrid(kv_hybrid_was);
     qsa_set_kv_elastic(kv_elastic_was);
     if (st_.kv_arena != nullptr) ss.kv_extra.push_back(st_.kv_arena);
+    if (st_.idx_arena != nullptr) ss.kv_extra.push_back(st_.idx_arena);
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;
@@ -177,6 +178,10 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     if (st_.kv_arena != nullptr) {   // the elastic working K/V: what is backed now, and what the whole context takes
         draft_kv_bytes += st_.kv_arena->mapped_bytes();
         draft_kv_max += st_.kv_arena->bytes_for(st_.kv_arena->max_cells());
+    }
+    if (st_.idx_arena != nullptr) {
+        draft_kv_bytes += st_.idx_arena->mapped_bytes();
+        draft_kv_max += st_.idx_arena->bytes_for(st_.idx_arena->max_cells());
     }
     LoadProgress::kv(LoadProgress::cuda(device_), draft_kv_bytes, max_cells, "draft", draft_kv_max);
 

@@ -216,9 +216,10 @@ struct QsaState {
     /// back: for Q4_0
     bool kv_rot = false;
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
-    /// The elastic KV (qsa_set_kv_elastic): the pool arrays above live in this arena's ranges, and only its first
-    /// `cells()` cells are backed.  Null: the pools are carved from the session arena, all backed.
+    /// The elastic KV (qsa_set_kv_elastic): K/V pools live in `kv_arena` and pooled indexer keys + primary RoPE
+    /// tables live in `idx_arena`, so K/V can shrink to a fixed streaming pool while the indexer stays mapped.
     KvArena* kv_arena = nullptr;
+    KvArena* idx_arena = nullptr;
     int64_t n_pages = 0;
     int64_t max_cells = 0;
 

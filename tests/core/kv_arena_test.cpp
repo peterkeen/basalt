@@ -2,6 +2,7 @@
 // back and keeps the cells below the cut exactly as they were; the addresses never move.  Needs a CUDA device with
 // virtual memory management (exits 77 without one).
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
+#include "basalt/models/qwen4exp/decode/session.hpp"
 
 #include <cuda_runtime.h>
 
@@ -129,7 +130,65 @@ int main() {
             !one.unmap(2 * kGrid + 1, err) || one.mapped_bytes() != one.bytes_for(8 * kGrid))
             return fail("one mapping per call stays", err);
     }
+    // split QSA elastic arenas: unmapping K/V down to 20,480 cells keeps idx_pooled and cos/sin mapped at 260,000
+    // while returning ~2.8 GiB of VRAM across the 12 QSA layers, and pre-carves KvStreamMap at fixed addresses
+    {
+        basalt::core::ModelGeometry g{};
+        constexpr int64_t kMaxCells = 262144, kFloor = 4096, kStream = 20480, kProbeCell = 260000;
+        basalt::core::qsa_set_kv_int8(true);
+        basalt::core::qsa_set_kv_elastic(kFloor);
+        const uint64_t sbytes = basalt::core::session_bytes(g, kMaxCells, 10);
+        void* sbuf = nullptr;
+        if (cudaMalloc(&sbuf, sbytes) != cudaSuccess) return fail("session alloc");
+        basalt::core::SessionState s;
+        if (basalt::core::session_init(g, kMaxCells, 10, sbuf, s) == 0) {
+            cudaFree(sbuf);
+            return fail("session init");
+        }
+        for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+            const basalt::core::QsaState& q = s.qsa_states[j];
+            if (q.kv_arena == nullptr || q.idx_arena == nullptr) return fail("split arenas missing");
+            if (q.map.ctl == nullptr || q.map.n_slots != kStream / 4) return fail("pre-carved stream map");
+        }
+        if (!basalt::core::session_kv_map(s, kMaxCells, err) || basalt::core::session_kv_cells(s) != kMaxCells)
+            return fail("session_kv_map 256k", err);
+        const int64_t probe_row = kProbeCell / 4;
+        std::vector<float> marker((size_t) g.idx_key_dim, 42.5f);
+        for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+            if (cudaMemcpy(s.qsa_states[j].idx_pooled + (size_t) probe_row * g.idx_key_dim, marker.data(),
+                           marker.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
+                return fail("write idx_pooled at 260k");
+        }
+        const size_t free_full = free_vram();
+        const uint64_t kv_before = basalt::core::session_kv_only_mapped_bytes(s);
+        if (!basalt::core::session_kv_only_unmap(s, kStream, err)) return fail("session_kv_only_unmap", err);
+        const uint64_t kv_after = basalt::core::session_kv_only_mapped_bytes(s);
+        const size_t free_shrunk = free_vram();
+        const uint64_t freed_arena = kv_before - kv_after;
+        if (freed_arena < (2800ull << 20) || free_shrunk <= free_full || free_shrunk - free_full < (2750ull << 20))
+            return fail("2.8 GiB VRAM returned");
+        // verify idx_pooled and primary RoPE tables at cell 260,000 remain backed and readable
+        std::vector<float> got_idx((size_t) g.idx_key_dim, 0.0f), got_cos(32, 0.0f), got_sin(32, 0.0f);
+        for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+            if (cudaMemcpy(got_idx.data(), s.qsa_states[j].idx_pooled + (size_t) probe_row * g.idx_key_dim,
+                           got_idx.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+                return fail("read idx_pooled after kv_only_unmap");
+            if (got_idx != marker) return fail("idx_pooled preserved after kv_only_unmap");
+        }
+        if (cudaMemcpy(got_cos.data(), s.qsa_states[0].cos_tab + (size_t) kProbeCell * 32, 32 * sizeof(float),
+                       cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(got_sin.data(), s.qsa_states[0].sin_tab + (size_t) kProbeCell * 32, 32 * sizeof(float),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            return fail("read cos/sin at 260k after kv_only_unmap");
+        float norm_sq = got_cos[0] * got_cos[0] + got_sin[0] * got_sin[0];
+        if (norm_sq < 0.999f || norm_sq > 1.001f) return fail("cos^2 + sin^2 == 1 at 260k");
+        basalt::core::session_release(s);
+        delete[] s.qsa_states;
+        cudaFree(sbuf);
+        basalt::core::qsa_set_kv_elastic(0);
+        basalt::core::qsa_set_kv_int8(false);
+    }
     std::puts("kv arena: whole pages backed and zeroed on demand, given back past the cut, addresses fixed, mappings "
-              "on a grid");
+              "on a grid, split K/V and indexer arenas verified");
     return 0;
 }

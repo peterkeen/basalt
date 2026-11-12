@@ -440,6 +440,11 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
 bool kv_elastic_state(const QsaShapes& s, const KvPlan& p) {
     return g_kv_elastic > 0 && p.mode == 0 && s.idx_block > 0 && s.page_size % s.idx_block == 0;
 }
+int64_t elastic_stream_slots(const QsaShapes& s, const KvPlan& p, int64_t ring_cells) {
+    if (!kv_elastic_state(s, p) || ring_cells != 0 || p.pages < basalt::kernels::kKvStreamMinSlots) return 0;
+    const int64_t r = (qsa_kv_resident_min() + s.page_size - 1) / s.page_size;
+    return std::min(p.pages, r);
+}
 uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8) {
     if (hybrid) {   // K8V4: the INT8 K half (codes + scales) plus the Q4_0 V half (kv_q4.hpp's rotation)
         const uint64_t rows = (uint64_t) pages * s.page_size * s.n_head_kv;
@@ -461,11 +466,12 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     uint64_t n = 0;
     const bool elastic = kv_elastic_state(s, p);   // elastic: pools, pooled keys and rope live in their own ranges
+    const int64_t map_slots = p.mode == 1 ? p.slots : elastic_stream_slots(s, p, ring_cells);
     if (!elastic)
         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
                            g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
-    if (p.mode == 1) n += basalt::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
+    if (map_slots > 0) n += basalt::kernels::kv_stream_map_bytes(map_slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
     if (!elastic) n += (uint64_t) p.pooled_rows * s.idx_dim * 4;               // pooled
@@ -501,68 +507,71 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     st.kv_arena = nullptr;
+    st.idx_arena = nullptr;
     std::vector<uint8_t> rope_cos_host, rope_sin_host;   // the rope table, kept to fill the arena as it grows
     if (kv_elastic_state(s, p)) {
-        // the same arrays, each in its own reserved range: per page, the row bytes of each array
+        // K/V arrays live in `kv_arena`; pooled indexer keys and primary RoPE tables live in `idx_arena` so a
+        // dynamically spilled slot can unmap K/V down to its streaming window while keeping indexer and RoPE mapped.
         const uint64_t pr = (uint64_t) s.n_head_kv * s.page_size;
         const uint64_t code = pr * s.head_dim, scale = pr * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2;
-        std::vector<uint64_t> page_bytes;
-        if (st.kv_hybrid) page_bytes = {code, scale, pr * q4_row};
-        else if (st.kv_q4) page_bytes = {pr * q4_row, pr * q4_row};
-        else if (st.kv_int8) page_bytes = {code, code, scale, scale};
-        else page_bytes = {code * 2, code * 2};
-        const size_t n_kv = page_bytes.size();
-        // then the indexer's pooled keys (one row per idx_block cells, two spare rows past the last block) and, for
-        // the state that owns the rope table, its cos and sin rows
+        std::vector<uint64_t> kv_page_bytes;
+        if (st.kv_hybrid) kv_page_bytes = {code, scale, pr * q4_row};
+        else if (st.kv_q4) kv_page_bytes = {pr * q4_row, pr * q4_row};
+        else if (st.kv_int8) kv_page_bytes = {code, code, scale, scale};
+        else kv_page_bytes = {code * 2, code * 2};
+
         const uint64_t row = (uint64_t) s.idx_dim * 4, rope_row = (uint64_t) (s.n_rot / 2) * 4;
-        page_bytes.push_back((uint64_t) (s.page_size / s.idx_block) * row);
-        std::vector<uint64_t> tails(page_bytes.size(), 0);
-        tails.back() = 2 * row;
+        std::vector<uint64_t> idx_page_bytes = {(uint64_t) (s.page_size / s.idx_block) * row};
+        std::vector<uint64_t> idx_tails = {2 * row};
         if (share_rope == nullptr) {
-            page_bytes.push_back((uint64_t) s.page_size * rope_row);
-            page_bytes.push_back((uint64_t) s.page_size * rope_row);
-            tails.resize(page_bytes.size(), 0);
-        }
-        // the table is built on the host (as below) and kept by the arena, which fills each page it maps from it
-        if (share_rope == nullptr) {
+            idx_page_bytes.push_back((uint64_t) s.page_size * rope_row);
+            idx_page_bytes.push_back((uint64_t) s.page_size * rope_row);
+            idx_tails.resize(idx_page_bytes.size(), 0);
             rope_cos_host.resize((size_t) max_cells * rope_row);
             rope_sin_host.resize((size_t) max_cells * rope_row);
             basalt::kernels::build_rope_table((int) s.n_rot, basalt::kernels::rope_scaling(), (int) max_cells,
                                               (float*) rope_cos_host.data(), (float*) rope_sin_host.data());
         }
-        KvArena* a = new KvArena();
+        const int64_t grid_cells = std::min<int64_t>(g_kv_elastic, 4096);
+        const int64_t init_cells = std::min(g_kv_elastic, max_cells);
+        KvArena* kva = new KvArena();
+        KvArena* idxa = new KvArena();
         std::string err;
-        if (!a->open(page_bytes, pages, s.page_size, err, tails)) {
+        if (!kva->open(kv_page_bytes, pages, s.page_size, err) ||
+            !idxa->open(idx_page_bytes, pages, s.page_size, err, idx_tails)) {
             basalt::log::error("basalt", "elastic KV: %s", err.c_str());
-            delete a;
+            delete idxa;
+            delete kva;
             return 0;
         }
         if (share_rope == nullptr) {
-            a->set_contents(n_kv + 1, std::move(rope_cos_host));
-            a->set_contents(n_kv + 2, std::move(rope_sin_host));
+            idxa->set_contents(1, std::move(rope_cos_host));
+            idxa->set_contents(2, std::move(rope_sin_host));
         }
-        // mapped on the floor's grid: a deep request's pages go back to a shallower one, or to a streamed slot pool
-        a->set_extent_cells(g_kv_elastic);
-        if (!a->map(std::min(g_kv_elastic, max_cells), err)) {
+        kva->set_extent_cells(grid_cells);
+        idxa->set_extent_cells(grid_cells);
+        if (!kva->map(init_cells, err) || !idxa->map(init_cells, err)) {
             basalt::log::error("basalt", "elastic KV: %s", err.c_str());
-            delete a;
+            delete idxa;
+            delete kva;
             return 0;
         }
-        st.kv_arena = a;
-        st.idx_pooled = (float*) a->array(n_kv);
+        st.kv_arena = kva;
+        st.idx_arena = idxa;
+        st.idx_pooled = (float*) idxa->array(0);
         if (share_rope == nullptr) {
-            st.cos_tab = (float*) a->array(n_kv + 1);
-            st.sin_tab = (float*) a->array(n_kv + 2);
+            st.cos_tab = (float*) idxa->array(1);
+            st.sin_tab = (float*) idxa->array(2);
         }
         if (st.kv_hybrid) {
-            st.k_q = (int8_t*) a->array(0); st.k_scale = (uint16_t*) a->array(1); st.v_q4 = a->array(2);
+            st.k_q = (int8_t*) kva->array(0); st.k_scale = (uint16_t*) kva->array(1); st.v_q4 = kva->array(2);
         } else if (st.kv_q4) {
-            st.k_q4 = a->array(0); st.v_q4 = a->array(1);
+            st.k_q4 = kva->array(0); st.v_q4 = kva->array(1);
         } else if (st.kv_int8) {
-            st.k_q = (int8_t*) a->array(0); st.v_q = (int8_t*) a->array(1);
-            st.k_scale = (uint16_t*) a->array(2); st.v_scale = (uint16_t*) a->array(3);
+            st.k_q = (int8_t*) kva->array(0); st.v_q = (int8_t*) kva->array(1);
+            st.k_scale = (uint16_t*) kva->array(2); st.v_scale = (uint16_t*) kva->array(3);
         } else {
-            st.k_pool = (uint16_t*) a->array(0); st.v_pool = (uint16_t*) a->array(1);
+            st.k_pool = (uint16_t*) kva->array(0); st.v_pool = (uint16_t*) kva->array(1);
         }
     } else if (st.kv_hybrid) {
         st.k_q = c.take<int8_t>(rows * s.head_dim);
@@ -583,27 +592,28 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.page_table = c.take<int32_t>((uint64_t) pages);
     st.n_pages = pages;
     st.max_cells = max_cells;
+    const int64_t map_slots = p.mode == 1 ? p.slots : elastic_stream_slots(s, p, ring_cells);
     st.map = basalt::kernels::KvStreamMap{};
     st.map.page_table = st.page_table;
     st.map.n_blocks = pages;
-    st.map.n_slots = p.slots;
-    if (p.mode == 1) {
-        st.map.slot_block = c.take<int32_t>((uint64_t) p.slots);
-        st.map.slot_stamp = c.take<int32_t>((uint64_t) p.slots);
-        st.map.slot_ref = c.take<int32_t>((uint64_t) p.slots);
-        st.map.miss_block = c.take<int32_t>((uint64_t) p.slots);
-        st.map.miss_slot = c.take<int32_t>((uint64_t) p.slots);
+    st.map.n_slots = map_slots > 0 ? map_slots : p.slots;
+    if (map_slots > 0) {
+        st.map.slot_block = c.take<int32_t>((uint64_t) map_slots);
+        st.map.slot_stamp = c.take<int32_t>((uint64_t) map_slots);
+        st.map.slot_ref = c.take<int32_t>((uint64_t) map_slots);
+        st.map.miss_block = c.take<int32_t>((uint64_t) map_slots);
+        st.map.miss_slot = c.take<int32_t>((uint64_t) map_slots);
         st.map.ctl = c.take<int32_t>((uint64_t) basalt::kernels::kKvCtlInts);
     }
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
     st.idx_pooled_rows = p.pooled_rows;
-    if (st.kv_arena == nullptr) st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    if (st.idx_arena == nullptr) st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
     st.idx_block_pos = c.take<int32_t>(1);
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
         st.sin_tab = share_rope->sin_tab;
-    } else if (st.kv_arena == nullptr) {
+    } else if (st.idx_arena == nullptr) {
         st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
     }
@@ -653,7 +663,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // agree with the host's libm.  A table shorter than the sequence would have the rotation read past it.
     // The process's rope scaling (none by default) is INSIDE the table - the rotation kernels cannot tell.
     if (share_rope == nullptr) {
-        if (st.kv_arena == nullptr) {   // an elastic state's arena is filled from the table as it maps
+        if (st.idx_arena == nullptr) {   // an elastic state's arena is filled from the table as it maps
             std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
             basalt::kernels::build_rope_table((int) s.n_rot, basalt::kernels::rope_scaling(), (int) max_cells,
                                               hc.data(), hs.data());
@@ -685,13 +695,15 @@ int64_t qsa_kv_elastic() { return g_kv_elastic; }
 void qsa_state_release(QsaState& st) {
     delete st.kv_arena;
     st.kv_arena = nullptr;
+    delete st.idx_arena;
+    st.idx_arena = nullptr;
 }
 
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
     // elastic: only the backed pages (the rest has no memory; mapping more zeroes it)
-    const int64_t pages = st.kv_arena != nullptr ? st.kv_arena->cells() / s.page_size : st.n_slots;
+    const int64_t pages = st.kv_arena != nullptr ? std::min(st.n_slots, st.kv_arena->cells() / s.page_size) : st.n_slots;
     const size_t rows = (size_t) pages * s.n_head_kv * s.page_size;
     if (st.kv_hybrid) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
@@ -716,8 +728,9 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     // elastic: the pooled rows of the backed pages and the spare rows past them (mapping more zeroes the rest)
+    const KvArena* ia = st.idx_arena != nullptr ? st.idx_arena : st.kv_arena;
     const int64_t pooled_rows =
-        st.kv_arena != nullptr ? std::min(st.idx_pooled_rows, st.kv_arena->cells() / s.idx_block + 2) : st.idx_pooled_rows;
+        ia != nullptr ? std::min(st.idx_pooled_rows, ia->cells() / s.idx_block + 2) : st.idx_pooled_rows;
     cudaMemsetAsync(st.idx_pooled, 0, (size_t) pooled_rows * s.idx_dim * 4, cs);
 }
 

@@ -109,10 +109,17 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
 
 // An elastic state backs only a prefix of its cells; a copy past it would fault inside the driver.
 bool backed(const QsaState& st, const Layout& l, std::string& error) {
-    if (!st.kv_arena || st.kv_arena->cells() >= l.cells) return true;
-    error = "conversation snapshot: " + std::to_string((long long) l.cells) + " cells to copy, " +
-            std::to_string((long long) st.kv_arena->cells()) + " backed";
-    return false;
+    if (st.kv_mode == 0 && st.kv_arena && st.kv_arena->cells() < l.cells) {
+        error = "conversation snapshot: " + std::to_string((long long) l.cells) + " cells to copy, " +
+                std::to_string((long long) st.kv_arena->cells()) + " backed";
+        return false;
+    }
+    if (l.pooled > 0 && st.idx_arena && st.idx_arena->cells() < l.cells) {
+        error = "conversation snapshot: " + std::to_string((long long) l.cells) + " indexer cells to copy, " +
+                std::to_string((long long) st.idx_arena->cells()) + " backed";
+        return false;
+    }
+    return true;
 }
 
 bool transfer(void* dst, const void* src, size_t n, std::string& error) {

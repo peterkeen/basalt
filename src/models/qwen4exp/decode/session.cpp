@@ -124,20 +124,28 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 }
 
 void session_release(SessionState& s) {
-    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) qsa_state_release(s.qsa_states[s.qsa_ord0 + j]);
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
-        if (s.qsa_states[j].owns_rope) {
-            basalt::kernels::rope_table_release(s.qsa_states[j].cos_tab);
-            s.qsa_states[j].owns_rope = false;
+        if (s.qsa_states[s.qsa_ord0 + j].owns_rope) {
+            basalt::kernels::rope_table_release(s.qsa_states[s.qsa_ord0 + j].cos_tab);
+            s.qsa_states[s.qsa_ord0 + j].owns_rope = false;
         }
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) qsa_state_release(s.qsa_states[s.qsa_ord0 + j]);
 }
 
 int64_t session_kv_cells(const SessionState& s) {
     int64_t c = -1;
+    const int64_t stream_floor = qsa_kv_resident_min();
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
-        const KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena;
+        const QsaState& q = s.qsa_states[s.qsa_ord0 + j];
+        const KvArena* a = q.kv_arena;
         if (a == nullptr) return -1;
-        c = c < 0 ? a->cells() : std::min(c, a->cells());
+        int64_t qc = a->cells();
+        if (q.kv_mode == 1 && q.idx_arena != nullptr) {
+            qc = a->cells() >= std::min(q.max_cells, stream_floor) ? q.idx_arena->cells() : 0;
+        } else if (q.idx_arena != nullptr) {
+            qc = std::min(qc, q.idx_arena->cells());
+        }
+        c = c < 0 ? qc : std::min(c, qc);
     }
     for (const KvArena* a : s.kv_extra) c = c < 0 ? a->cells() : std::min(c, a->cells());
     return c;
@@ -145,43 +153,89 @@ int64_t session_kv_cells(const SessionState& s) {
 
 uint64_t session_kv_grow_bytes(const SessionState& s, int64_t cells) {
     uint64_t b = 0;
-    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
-        if (const KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena) b += a->grow_bytes(cells);
+    const int64_t stream_floor = qsa_kv_resident_min();
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+        const QsaState& q = s.qsa_states[s.qsa_ord0 + j];
+        if (q.kv_arena != nullptr)
+            b += q.kv_arena->grow_bytes(q.kv_mode == 1 ? std::min(q.max_cells, stream_floor) : cells);
+        if (q.idx_arena != nullptr) b += q.idx_arena->grow_bytes(cells);
+    }
     for (const KvArena* a : s.kv_extra) b += a->grow_bytes(cells);
     return b;
 }
 
 uint64_t session_kv_bytes_for(const SessionState& s, int64_t cells) {
     uint64_t b = 0;
-    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
-        if (const KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena) b += a->bytes_for(cells);
+    const int64_t stream_floor = qsa_kv_resident_min();
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+        const QsaState& q = s.qsa_states[s.qsa_ord0 + j];
+        if (q.kv_arena != nullptr)
+            b += q.kv_arena->bytes_for(q.kv_mode == 1 ? std::min(q.max_cells, stream_floor) : cells);
+        if (q.idx_arena != nullptr) b += q.idx_arena->bytes_for(cells);
+    }
     for (const KvArena* a : s.kv_extra) b += a->bytes_for(cells);
     return b;
 }
 
 uint64_t session_kv_mapped_bytes(const SessionState& s) {
     uint64_t b = 0;
-    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
-        if (const KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena) b += a->mapped_bytes();
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+        const QsaState& q = s.qsa_states[s.qsa_ord0 + j];
+        if (q.kv_arena != nullptr) b += q.kv_arena->mapped_bytes();
+        if (q.idx_arena != nullptr) b += q.idx_arena->mapped_bytes();
+    }
     for (const KvArena* a : s.kv_extra) b += a->mapped_bytes();
     return b;
 }
 
-bool session_kv_map(SessionState& s, int64_t cells, std::string& err) {
+uint64_t session_kv_only_mapped_bytes(const SessionState& s) {
+    uint64_t b = 0;
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
-        if (KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena)
-            if (!a->map(cells, err)) return false;
+        if (const KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena) b += a->mapped_bytes();
+    return b;
+}
+
+uint64_t session_kv_only_bytes_for(const SessionState& s, int64_t cells) {
+    uint64_t b = 0;
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        if (const KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena) b += a->bytes_for(cells);
+    return b;
+}
+
+bool session_kv_map(SessionState& s, int64_t cells, std::string& err) {
+    const int64_t stream_floor = qsa_kv_resident_min();
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+        QsaState& q = s.qsa_states[s.qsa_ord0 + j];
+        if (q.kv_arena != nullptr)
+            if (!q.kv_arena->map(q.kv_mode == 1 ? std::min(q.max_cells, stream_floor) : cells, err)) return false;
+        if (q.idx_arena != nullptr)
+            if (!q.idx_arena->map(cells, err)) return false;
+    }
     for (KvArena* a : s.kv_extra)
         if (!a->map(cells, err)) return false;
     return true;
 }
 
 bool session_kv_unmap(SessionState& s, int64_t cells, std::string& err) {
-    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
-        if (KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena)
-            if (!a->unmap(cells, err)) return false;
+    const int64_t stream_floor = qsa_kv_resident_min();
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+        QsaState& q = s.qsa_states[s.qsa_ord0 + j];
+        if (q.kv_arena != nullptr) {
+            const int64_t kv_keep = q.kv_mode == 1 ? std::max(cells, std::min(q.max_cells, stream_floor)) : cells;
+            if (!q.kv_arena->unmap(kv_keep, err)) return false;
+        }
+        if (q.idx_arena != nullptr)
+            if (!q.idx_arena->unmap(cells, err)) return false;
+    }
     for (KvArena* a : s.kv_extra)
         if (!a->unmap(cells, err)) return false;
+    return true;
+}
+
+bool session_kv_only_unmap(SessionState& s, int64_t kv_cells, std::string& err) {
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        if (KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena)
+            if (!a->unmap(kv_cells, err)) return false;
     return true;
 }
 
