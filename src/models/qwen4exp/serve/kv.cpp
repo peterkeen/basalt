@@ -184,9 +184,10 @@ bool QfnRuntime::maybe_promote_to_vram(std::string& e) {
         if (!basalt::core::session_promote_to_vram(*u, g, live, want, e) || !sync_session_qsa_mode(*u, e))
             return false;
         ++kv_moves;
-        basalt::log::info("basalt serve", "KV tier: %s promoted back to VRAM (%lld live cells in %.1f ms)",
-                          session_label(*u).c_str(), (long long) live,
-                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        basalt::log::info("basalt serve", "KV tier: %s promoted back to VRAM (%lld live cells in %.1f ms, "
+                          "%.0f MiB host KV pinned)", session_label(*u).c_str(), (long long) live,
+                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                          (double) basalt::core::qsa_kv_host_bytes() / 1048576.0);
         kv_ceiling_note();
     }
     return true;
