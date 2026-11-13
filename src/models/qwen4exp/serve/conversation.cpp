@@ -495,10 +495,10 @@ bool QfnRuntime::park_one(int b, std::string& e) {
     ids.clear();
     imgs.clear();
     cks.clear();
-    for (int64_t j = 0; j < u.qsa_alloc; ++j) {
-        basalt::core::QsaState& q = u.qsa_states[u.qsa_ord0 + j];
-        if (q.kv_arena != nullptr && !q.kv_arena->unmap(kv_floor, e)) { e = "elastic KV: " + e; return false; }
-        if (q.idx_arena != nullptr && !q.idx_arena->unmap(kv_floor, e)) { e = "elastic KV: " + e; return false; }
+    const bool streamed = basalt::core::session_is_streamed(u);
+    if (!basalt::core::session_reset_to_vram(u, kv_floor, e) || (streamed && !sync_session_qsa_mode(u, e))) {
+        e = "elastic KV: " + e;
+        return false;
     }
     ++kv_moves;
     char where[64];

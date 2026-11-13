@@ -63,7 +63,7 @@ bool QfnRuntime::batch_step() {
                 continue;
             }
             if (!ke.empty()) { std::printf("ERR %s\n", ke.c_str()); return false; }
-            if (at + 2 * MR > backed) kv_wait[(size_t) b] = 1;
+            if (ov_active || at + 2 * MR > backed) kv_wait[(size_t) b] = 1;
         }
     for (int b = 0; b < (int) bs.size() && S < MR; ++b)
         if (bs[(size_t) b].active && !kv_wait[(size_t) b]) {
@@ -396,6 +396,12 @@ bool QfnRuntime::batch_step() {
         bt_commit += msd(c0, Clock::now());
     }
     basalt::core::progress().busy.store(was_busy);
+    bool finished = false;
+    for (int sg = 0; sg < S; ++sg) finished = finished || fin_of[sg] != nullptr;
+    if (finished && !maybe_promote_to_vram(err)) {
+        std::printf("ERR %s\n", err.c_str());
+        return false;
+    }
     if (!batch_on() && bt_windows > 0) {
         const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
         const double L = (double) g.n_layers;

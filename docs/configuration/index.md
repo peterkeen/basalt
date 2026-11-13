@@ -96,6 +96,12 @@ Command line `--name`; the Where column says which config block takes it.
 | `rope-freq-base`, `rope-freq-scale` | engine | number | 0 (model's own) | Flash-Next only. Raw RoPE values. Leave at 0 unless you know them. |
 | `yarn-orig-ctx`, `yarn-ext-factor`, `yarn-attn-factor`, `yarn-beta-fast`, `yarn-beta-slow` | engine | number | 0 (262144), auto, 1, 32, 1 | Flash-Next only. YaRN parameters, as in llama.cpp. |
 
+With Flash-Next's elastic KV and `kv: int8`, sessions start in VRAM and switch to demand-allocated pinned RAM when
+competing contexts would take the expert cache below its prompt floor. Streamed sessions keep 20,480 cells of K/V
+in VRAM; the indexer stays resident. At request boundaries, sessions return to VRAM when there is room with a
+256 MiB margin. Automatic transitions require a single-card prompt path (no prompt or layer split); peer expert
+tiers are supported. Other KV formats keep their existing storage path.
+
 ## Expert cache and memory
 
 | Setting | Where | Type, values | Default | What it does |

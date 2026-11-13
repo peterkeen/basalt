@@ -81,6 +81,10 @@ bool QfnRuntime::demote_one_to_stream(basalt::core::SessionState& req, int64_t r
     if (best == nullptr) return true;
 
     const auto t0 = Clock::now();
+    // An arriving session may still be below the stream floor: fund its staging pages from the cache first.
+    if (basalt::core::session_kv_only_bytes_for(*best, stream_floor) >
+            basalt::core::session_kv_only_mapped_bytes(*best) && !kv_fit(*best, stream_floor, e))
+        return false;
     const uint64_t before_b = basalt::core::session_kv_only_mapped_bytes(*best);
     const int64_t live = live_cells_of(*best);
     if (!basalt::core::session_demote_to_stream(*best, g, live, e)) {
@@ -91,8 +95,9 @@ bool QfnRuntime::demote_one_to_stream(basalt::core::SessionState& req, int64_t r
     if (!sync_session_qsa_mode(*best, e)) return false;
     const uint64_t after_b = basalt::core::session_kv_only_mapped_bytes(*best);
     const double freed_mib = before_b > after_b ? (double) (before_b - after_b) / 1048576.0 : 0.0;
-    basalt::log::info("basalt serve", "KV tier: %s demoted to host RAM streaming (%lld live cells, %.0f MiB VRAM "
-                         "freed in %.1f ms)", session_label(*best).c_str(), (long long) live, freed_mib,
+    basalt::log::info("basalt serve", "KV tier: %s demoted to host RAM streaming (%lld live cells, %.0f MiB host KV, "
+                         "%.0f MiB VRAM freed in %.1f ms)", session_label(*best).c_str(), (long long) live,
+                      (double) basalt::core::session_host_kv_bytes(*best) / 1048576.0, freed_mib,
                       std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
     demoted = true;
     return true;
@@ -117,6 +122,7 @@ bool QfnRuntime::maybe_promote_to_vram(std::string& e) {
             streamed.push_back(&ss);
     }
     if (streamed.empty()) return true;
+    if (ba_job) { ba_thr.join(); ba_job = false; }   // no adaptive copy races the cache's resize
 
     constexpr int64_t kHysteresisBytes = 256ll << 20;
     for (basalt::core::SessionState* u : streamed) {
@@ -135,13 +141,23 @@ bool QfnRuntime::maybe_promote_to_vram(std::string& e) {
                             (int64_t) basalt::core::session_kv_grow_bytes(*u, want);
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const int64_t room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+        int64_t room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
         int64_t spare_cache = 0;
         if (xcache.segmented()) {
             const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
             spare_cache = gran * basalt::program::kv_cache_spare_granules(
                                      xcache.mapped_bytes(), gran, cache_floor_slots(),
                                      [&](int64_t keep) { return xcache.slots_after_shrink(keep); });
+        }
+        bool active = false;
+        for (size_t b = 0; !bslot_ss.empty() && b < bslot_ss[0].size() && b < bs.size(); ++b)
+            active = active || (bs[b].active && bslot_ss[0][b]->qsa_states == u->qsa_states);
+        // A finished slot's cached conversation must not keep a remaining decoder in the host tier.
+        if (active && !solo_busy && room + spare_cache < add + kHysteresisBytes && !idle_list(u, true).empty()) {
+            if (!kv_drain(e) || park_idle(u, add + kHysteresisBytes - room - spare_cache, true, e) < 0)
+                return false;
+            cudaMemGetInfo(&free_b, &total_b);
+            room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
         }
         if (room + spare_cache < add + kHysteresisBytes) continue;
         const auto t0 = Clock::now();
@@ -554,6 +570,7 @@ bool QfnRuntime::kv_release(basalt::core::SessionState& s, int64_t cells, std::s
             kv_ceiling_note();
             return true;
         }
+        if (!kv_drain(e)) return false;
         const int64_t keep_pages = (cells + 3) / 4;
         for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
             basalt::core::QsaState& q = s.qsa_states[s.qsa_ord0 + j];

@@ -15,7 +15,11 @@ bool QfnRequest::slot_draft_in(int slot) {
     return true;
 }
 void QfnRequest::drop_stale_reuse() { runtime_.conversations->drop_reuse_unless(runtime_.rsp); }
-bool QfnRequest::release_room() { return runtime_.kv_release(*runtime_.rsp, n + runtime_.kKvGrowCells, runtime_.err); }
+bool QfnRequest::release_room() {
+    if (!runtime_.kv_release(*runtime_.rsp, n + runtime_.kKvGrowCells, runtime_.err)) return false;
+    runtime_.active_decode_pos = resume;
+    return runtime_.maybe_promote_to_vram(runtime_.err);
+}
 bool QfnRequest::checkpoint_mount(const ConvCheckpoint& c) {
     if (!checkpoint_restore(c, *runtime_.rsp, runtime_.g) || c.stage_parts.size() != runtime_.stages.size()) return false;
     for (size_t i = 0; i < runtime_.stages.size(); ++i) {

@@ -434,10 +434,14 @@ void kv_stream_warm_recent(const KvStreamMap& m, const QsaAttnPools& vram, int64
         const size_t scales_b = rows * (size_t) (s.head_dim / KV_Q8_GROUP) * 2;
         uint8_t* arr[4] = {(uint8_t*) vram.k_q, (uint8_t*) vram.v_q, (uint8_t*) vram.k_scale, (uint8_t*) vram.v_scale};
         const size_t len[4] = {codes_b, codes_b, scales_b, scales_b};
+        // Copy forward in disjoint runs when the recent range overlaps the destination slots.
         for (int a = 0; a < 4; ++a)
-            if (cudaMemcpyAsync(arr[a], arr[a] + (size_t) b0 * len[a], (size_t) warm * len[a],
-                                cudaMemcpyDeviceToDevice, cs) != cudaSuccess)
-                check("warm d2d");
+            for (int64_t at = 0; at < warm; at += b0) {
+                const size_t bytes = (size_t) std::min(b0, warm - at) * len[a];
+                if (cudaMemcpyAsync(arr[a] + (size_t) at * len[a], arr[a] + (size_t) (b0 + at) * len[a], bytes,
+                                    cudaMemcpyDeviceToDevice, cs) != cudaSuccess)
+                    check("warm d2d");
+            }
     }
     warm_recent_kernel<<<128, 256, 0, cs>>>(m, b0, warm);
     check("warm map");
