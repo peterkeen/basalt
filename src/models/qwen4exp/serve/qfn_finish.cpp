@@ -119,24 +119,35 @@ void QfnRequest::report_request(const DoneCounts& dc) {
         basalt::log::info("basalt serve", "expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, files %lld blobs "
                              "%.1f MB read", (long long) req_hits, (long long) runtime_.src.ram_reads(),
                      (long long) runtime_.src.file_reads(), (double) runtime_.src.file_read_bytes() / 1e6);
-    if (runtime_.g.n_qsa_layers() > 0 && runtime_.ss.qsa_states[runtime_.ss.qsa_primary()].kv_mode == 1) {
-        // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
-        // (this device's owned ordinals; a split's other stages hold theirs)
-        uint64_t miss = 0, look = 0;
+    if (runtime_.g.n_qsa_layers() > 0) {
+        // KV streaming, cumulative over the process across all sessions that have streamed
+        uint64_t miss = 0, look = 0, calls = 0;
         bool over = false;
-        for (int64_t j = 0; j < runtime_.ss.qsa_alloc; ++j) {
-            const basalt::kernels::KvStreamCounters c =
-                basalt::kernels::kv_stream_counters(runtime_.ss.qsa_states[runtime_.ss.qsa_ord0 + j].map);
-            miss += c.misses; look += c.lookups; over = over || c.overflow;
+        std::vector<const basalt::core::SessionState*> seen = {&runtime_.ss};
+        for (size_t b = 0; !runtime_.bslot_ss.empty() && b < runtime_.bslot_ss[0].size(); ++b)
+            if (runtime_.bslot_ss[0][b]->qsa_states != runtime_.ss.qsa_states) seen.push_back(runtime_.bslot_ss[0][b].get());
+        for (const basalt::core::SessionState* s : seen) {
+            for (int64_t j = 0; s->qsa_states != nullptr && j < s->qsa_alloc; ++j) {
+                const basalt::core::QsaState& q = s->qsa_states[s->qsa_ord0 + j];
+                if (q.map.ctl == nullptr) continue;
+                const basalt::kernels::KvStreamCounters c = basalt::kernels::kv_stream_counters(q.map);
+                miss += c.misses; look += c.lookups; calls += c.calls; over = over || c.overflow;
+            }
         }
-        basalt::log::info("basalt serve", "KV streaming: %.2f%% of %llu block reads hit VRAM, %.1f MiB read "
-                             "from RAM%s", look ? 100.0 * (double) (look - miss) / (double) look : 100.0,
-                     (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
-                     over ? " - OVERFLOW (too few resident cells)" : "");
+        if (calls > 0 || runtime_.ss.qsa_states[runtime_.ss.qsa_primary()].kv_mode == 1)
+            basalt::log::info("basalt serve", "KV streaming: %.2f%% of %llu block reads hit VRAM, %.1f MiB read "
+                                 "from RAM%s", look ? 100.0 * (double) (look - miss) / (double) look : 100.0,
+                         (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
+                         over ? " - OVERFLOW (too few resident cells)" : "");
     }
     if (sfx_windows > 0)
         basalt::log::info("basalt serve", "suffix drafts: %lld windows, %lld of %lld drafts accepted",
                      (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);
+    if (runtime_.admit_slot < 0) {
+        std::string pe;
+        if (!runtime_.maybe_promote_to_vram(pe))
+            basalt::log::warn("basalt serve", "%s", pe.c_str());
+    }
 }
 
 }  // namespace basalt::models::qwen4exp::serve

@@ -60,6 +60,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         return false;
     }
     batch_stream_ = false;
+    bool stream_at_init = false;
     for (int64_t l = lb_; l < le_; ++l) {
         if (!is_qsa_layer(*g_, l)) continue;
         int64_t qi = 0;
@@ -74,7 +75,10 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
                 err = "verify: a streamed slot holds too few pages for the resolve; raise --kv-resident";
                 return false;
             }
-            batch_stream_ = batch_stream_ || st.kv_mode == 1;
+            stream_at_init = stream_at_init || st.kv_mode == 1;
+            // Record `kv_stream_resolve_seg` into batch graphs whenever slots carry pre-carved streaming maps:
+            // resident slots keep `e.map.ctl == nullptr` and return immediately with zero recapture on `0 <-> 1`.
+            batch_stream_ = batch_stream_ || st.kv_mode == 1 || qsa_can_stream(st);
         }
     }
     const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;
@@ -126,7 +130,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     batch_dm_ = dm_ != nullptr;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     basalt::log::info("basalt verify", "batch windows of up to %lld sequences (layers [%lld, %lld))%s", (long long) S,
-                 (long long) lb_, (long long) le_, batch_stream_ ? ", the slots' K/V streamed from RAM" : "");
+                 (long long) lb_, (long long) le_, stream_at_init ? ", the slots' K/V streamed from RAM" : "");
     if (dm_ != nullptr && dm_->stage_src != nullptr)
         basalt::log::info("basalt verify", "batch windows: a layer with %d+ CPU misses sends a share of them over PCIe to "
                           "CUDA0", dm_->stage_min);
@@ -174,6 +178,63 @@ bool Verifier::warm_graphs(std::string& err) {
     for (int R = 1; R <= max_t_; ++R)
         if (!capture_batch(R, 0, err) || !capture_commit_batch(R, err)) return false;
     return true;
+}
+
+bool Verifier::update_slot_qsa(int slot, const SessionState& s, std::string& err) {
+    if (slot < 0 || slot >= (int) slots_.size() || g_ == nullptr || d_qslots_.empty()) return true;
+    const OnDevice on_device(device_);
+    const basalt::kernels::QsaShapes sh = shapes_of(*g_);
+    const int64_t TS = (sh.idx_block - 1) * g_->idx_key_dim, nQ = g_->n_qsa_layers();
+    for (int64_t l = lb_; l < le_; ++l) {
+        if (!is_qsa_layer(*g_, l)) continue;
+        int64_t qi = 0;
+        for (int64_t m = 0; m < l; ++m) qi += is_qsa_layer(*g_, m) ? 1 : 0;
+        if ((size_t) qi >= d_qslots_.size() || d_qslots_[(size_t) qi] == nullptr) continue;
+        const QsaState& st = s.qsa_states[qi];
+        basalt::kernels::QsaSegSlot e{};
+        e.k_pool = st.k_pool; e.v_pool = st.v_pool; e.k_q = st.k_q; e.v_q = st.v_q;
+        e.k_scale = st.k_scale; e.v_scale = st.v_scale; e.page_table = st.page_table;
+        if (st.kv_mode == 1) {
+            e.host = st.host;
+            e.map = st.map;
+        }
+        e.tail = st.idx_tail; e.dead = st.idx_dead; e.pooled = st.idx_pooled;
+        e.tail_snap = tail_snap_b_ + ((size_t) slot * nQ + qi) * TS;
+        e.block_pos = st.idx_block_pos; e.max_cells = (int32_t) st.max_cells;
+        if (cudaMemcpy(d_qslots_[(size_t) qi] + slot, &e, sizeof(e), cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = std::string("verify: updating slot QSA state failed: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+    }
+    return next_ == nullptr || next_->update_slot_qsa(slot, s, err);
+}
+
+void Verifier::invalidate_qsa(const QsaState* qsa_states) {
+    if (qsa_states == nullptr || g_ == nullptr) return;
+    const OnDevice on_device(device_);
+    std::string werr;
+    (void) wait_commit(werr);
+    if (cs_ != nullptr) cudaStreamSynchronize(cs_);
+    if (ss_ != nullptr && ss_->qsa_states == qsa_states) {
+        for (auto& e : exec_)
+            if (e != nullptr) { cudaGraphExecDestroy(e); e = nullptr; }
+        for (auto& e : exec_nr_)
+            if (e != nullptr) { cudaGraphExecDestroy(e); e = nullptr; }
+        if (commit_exec_ != nullptr) { cudaGraphExecDestroy(commit_exec_); commit_exec_ = nullptr; }
+    }
+    for (auto it = solo_sets_.begin(); it != solo_sets_.end();) {
+        if (it->first != nullptr && it->first->qsa_states == qsa_states) {
+            for (auto& e : it->second.exec)
+                if (e != nullptr) cudaGraphExecDestroy(e);
+            for (auto& e : it->second.exec_nr)
+                if (e != nullptr) cudaGraphExecDestroy(e);
+            if (it->second.commit != nullptr) cudaGraphExecDestroy(it->second.commit);
+            it = solo_sets_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (next_ != nullptr) next_->invalidate_qsa(qsa_states);
 }
 
 }  // namespace basalt::core

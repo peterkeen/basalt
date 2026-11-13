@@ -111,6 +111,10 @@ void QfnRuntime::between_requests(const std::string& line) {
         Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
         save_profile("periodic");
     if (ba_job) { ba_thr.join(); ba_job = false; }   // (a request runs the same copy steps itself)
+    if (line != "QUIT") {
+        std::string pe;
+        if (!maybe_promote_to_vram(pe)) basalt::log::warn("basalt serve", "%s", pe.c_str());
+    }
 }
 
 void QfnRuntime::after_input_start() { sp.should_stop = [&] { return halted(); }; }

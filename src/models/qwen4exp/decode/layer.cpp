@@ -482,6 +482,88 @@ bool qsa_host_kv_ensure(QsaState& st, int64_t cell_lo, int64_t cell_hi, std::str
     return st.host_pool->ensure_writable(st.host_tab, page_lo, exact_hi, err, stream);
 }
 
+bool qsa_can_stream(const QsaState& st) {
+    return st.kv_int8 && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 && st.kv_arena != nullptr && st.idx_arena != nullptr &&
+           st.host_pool != nullptr && st.map.ctl != nullptr && st.map.n_slots >= basalt::kernels::kKvStreamMinSlots;
+}
+
+bool qsa_state_demote_to_stream(QsaState& st, const ModelGeometry& g, int64_t live_cells, std::string& err) {
+    if (st.kv_mode == 1) return true;
+    if (!qsa_can_stream(st)) {
+        err = "QSA state cannot dynamically stream to host RAM";
+        return false;
+    }
+    const QsaShapes s = qsa_shapes(g);
+    const int64_t stream_cells = std::min(st.max_cells, st.map.n_slots * s.page_size);
+    if (st.kv_arena->cells() < stream_cells && !st.kv_arena->map(stream_cells, err)) return false;
+    live_cells = std::clamp<int64_t>(live_cells, 0, st.kv_arena->cells());
+    const int64_t pages = (live_cells + s.page_size - 1) / s.page_size;
+    st.host_pool->release_range(st.host_tab, pages, /*keep_spare=*/true);
+    if (pages > 0 && !st.host_pool->ensure_writable(st.host_tab, 0, pages, err)) return false;
+    uint8_t* const* d_slabs = st.host_pool->device_slabs(st.host_tab.device);
+    if (d_slabs == nullptr) {
+        err = "HostKvPool: device slab directory allocation failed";
+        return false;
+    }
+    const basalt::kernels::HostKvView paged{d_slabs, st.host_tab.d_pages};
+    if (pages > 0) basalt::kernels::kv_scatter_to_host_paged(qsa_attn_pools(st), paged, pages, s, nullptr);
+    basalt::kernels::kv_stream_warm_recent(st.map, qsa_attn_pools(st), pages, s, nullptr);
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = std::string("demoting KV to host RAM failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    if (!st.kv_arena->unmap(stream_cells, err)) return false;
+    st.host = basalt::kernels::KvHostPools{};
+    st.host.paged = paged;
+    st.kv_mode = 1;
+    st.n_slots = st.map.n_slots;
+    return true;
+}
+
+bool qsa_state_promote_to_vram(QsaState& st, const ModelGeometry& g, int64_t live_cells, int64_t map_cells, std::string& err) {
+    if (st.kv_mode == 0) return true;
+    if (st.kv_mode != 1 || st.kv_arena == nullptr || st.host_pool == nullptr) {
+        err = "QSA state cannot promote back to VRAM";
+        return false;
+    }
+    const QsaShapes s = qsa_shapes(g);
+    live_cells = std::clamp<int64_t>(live_cells, 0, st.max_cells);
+    map_cells = std::clamp<int64_t>(std::max(map_cells, live_cells), 0, st.max_cells);
+    if (!st.kv_arena->map(map_cells, err)) return false;
+    if (st.idx_arena != nullptr && !st.idx_arena->map(map_cells, err)) return false;
+    const int64_t pages = std::clamp<int64_t>((live_cells + s.page_size - 1) / s.page_size, 0,
+                                              st.kv_arena->cells() / s.page_size);
+    if (pages > 0)
+        basalt::kernels::kv_stage_from_host(qsa_attn_pools(st), st.host, basalt::kernels::kKvInt8, pages, s, nullptr);
+    basalt::kernels::kv_ring_table(st.page_table, st.n_pages, st.n_pages, nullptr);
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = std::string("promoting KV back to VRAM failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    st.host_pool->release_range(st.host_tab, 0, /*keep_spare=*/false);
+    st.host = basalt::kernels::KvHostPools{};
+    st.kv_mode = 0;
+    st.n_slots = st.n_pages;
+    return true;
+}
+
+bool qsa_state_reset_to_vram(QsaState& st, int64_t floor_cells, std::string& err) {
+    if (st.host_pool != nullptr) st.host_pool->release_range(st.host_tab, 0, /*keep_spare=*/false);
+    if (st.kv_mode == 1) {
+        st.host = basalt::kernels::KvHostPools{};
+        st.kv_mode = 0;
+        st.n_slots = st.n_pages;
+        basalt::kernels::kv_ring_table(st.page_table, st.n_pages, st.n_pages, nullptr);
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            err = std::string("resetting streamed KV state failed: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+    }
+    if (st.kv_arena != nullptr && !st.kv_arena->unmap(floor_cells, err)) return false;
+    if (st.idx_arena != nullptr && !st.idx_arena->unmap(floor_cells, err)) return false;
+    return true;
+}
+
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);

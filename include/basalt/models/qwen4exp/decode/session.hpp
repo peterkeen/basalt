@@ -120,6 +120,13 @@ bool session_kv_unmap(SessionState& s, int64_t cells, std::string& err);
 bool session_kv_only_unmap(SessionState& s, int64_t kv_cells, std::string& err);
 /// Ensures streamed `HostKvPool` pages covering `[cell_lo, cell_hi)` are allocated and COW-unshared across `s`.
 bool session_host_kv_ensure(SessionState& s, int64_t cell_lo, int64_t cell_hi, std::string& err, void* stream = nullptr);
+/// Dynamic KV tiering (`0 <-> 1`) across all owned QSA layers of `s`.
+bool session_can_stream(const SessionState& s);
+bool session_is_streamed(const SessionState& s);
+uint64_t session_host_kv_bytes(const SessionState& s);
+bool session_demote_to_stream(SessionState& s, const ModelGeometry& g, int64_t live_cells, std::string& err);
+bool session_promote_to_vram(SessionState& s, const ModelGeometry& g, int64_t live_cells, int64_t map_cells, std::string& err);
+bool session_reset_to_vram(SessionState& s, int64_t floor_cells, std::string& err);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);

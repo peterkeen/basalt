@@ -5,7 +5,9 @@
 namespace basalt::models::qwen4exp::serve {
 
 int64_t QfnRuntime::part_slots(const PfPart& p, int64_t c) {
-    return serve_loans::cache_slots_for(*p.cache, basalt::prefill::Prefill::bytes_needed(g, *p.ses, c));
+    const basalt::core::SessionState& ses = (p.sp == &sp && rsp != nullptr) ? *rsp : *p.ses;
+    const int64_t st_cells = (p.sp == &sp) ? prefill_stage_cells : 0;
+    return serve_loans::cache_slots_for(*p.cache, basalt::prefill::Prefill::bytes_needed(g, ses, c, st_cells));
 }
 
 uint64_t QfnRuntime::part_bytes(const PfPart& p, int32_t first) {
@@ -127,7 +129,17 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     // the full depth is restored on the way out for the sizing done elsewhere
     const bool beside = runtime_.batch_on() && (tokens > runtime_.kReadAlone || resumed_chunk > 0);
     basalt::prefill::Prefill::set_ring_depth(beside ? runtime_.kRingDecoding : 1 << 20);
-    struct RingReset { ~RingReset() { basalt::prefill::Prefill::set_ring_depth(1 << 20); } } ring_reset;
+    const int64_t prev_stage_cells = runtime_.prefill_stage_cells;
+    runtime_.prefill_stage_cells = n;
+    runtime_.sp.set_stage_cells(n);
+    struct RingReset {
+        int64_t* sc;
+        int64_t prev;
+        ~RingReset() {
+            basalt::prefill::Prefill::set_ring_depth(1 << 20);
+            *sc = prev;
+        }
+    } ring_reset{&runtime_.prefill_stage_cells, prev_stage_cells};
     // what this segment needs, capped by the configured chunk: a request lends only what its own
     // prompt needs, so a large chunk costs a short prompt nothing
     // A bare `auto` reads a prompt in equal chunks of at most this many tokens: past a few thousand tokens
@@ -159,6 +171,13 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
         }));
         cap = std::min(cap, lc);
     }
+    if (!runtime_.pf_parts.empty() && runtime_.pf_parts[0].first >= 0) {
+        const int64_t avail_slots = std::max<int64_t>(0, runtime_.pf_parts[0].cache->slots() - 128);
+        const int64_t lc = std::max<int64_t>(256, engine_local::biggest_chunk(cap, [&](int64_t t) {
+            return runtime_.part_slots(runtime_.pf_parts[0], t) <= avail_slots;
+        }));
+        cap = std::min(cap, lc);
+    }
     auto [want_full, head_tok] = serve_loans::one_card_chunks(tokens, cap, !beside && runtime_.stages.empty(),
                                                            runtime_.o.prefill_auto_fit);
     // a chunk the read must have: a split read's, or the one the read this continues had (if it fits)
@@ -175,13 +194,15 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     }
     bool any = false;
     const int ring_now = (int) basalt::prefill::Prefill::ring_slots_for(want);
+    const bool rsp_streamed = runtime_.rsp != nullptr && basalt::core::session_is_streamed(*runtime_.rsp);
     for (PfPart& p : runtime_.pf_parts) {
         if (p.first < 0) continue;
-        const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - runtime_.part_slots(p, want)));
+        const int32_t need_first = (int32_t) (p.cache->slots() - runtime_.part_slots(p, want));
+        const int32_t first = need_first >= p.first ? need_first : std::max<int32_t>(128, need_first);
         std::vector<serve_loans::LentEntry> again;   // taken again: their slots hold no expert
         if (!p.lent.empty()) {
-            if (want <= p.lent_chunk && p.sp->ring_depth() == ring_now && !ov_copied &&
-                (fixed_chunk <= 0 || want == p.sp->chunk()))
+            if (want <= p.lent_chunk && p.sp->ring_depth() == ring_now && !ov_copied && !rsp_streamed &&
+                first >= p.first_now && (fixed_chunk <= 0 || want == p.sp->chunk()))
                 continue;   // its loan covers this (a fixed chunk must be the layout's)
             // the slots the new loan takes again are not refilled first (their experts would be
             // overwritten by the new layout): only their table entries go back, and the loop that follows
@@ -204,7 +225,7 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
             if (!runtime_.move_routed_below(first, "prompt loan", e, &again)) return false;
             any = true;
         }
-        if (want != p.sp->chunk() || first != p.first_now || p.sp->ring_depth() != ring_now) {
+        if (want != p.sp->chunk() || first != p.first_now || p.sp->ring_depth() != ring_now || rsp_streamed) {
             if (!p.sp->relayout(want, p.cache->device_slot(first), runtime_.part_bytes(p, first), e)) return false;
             p.first_now = first;
         }

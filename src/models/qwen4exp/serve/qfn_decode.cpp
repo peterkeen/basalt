@@ -136,6 +136,7 @@ inline void QfnRequest::fill_drafts(int T, bool from_sfx) {
 }
 
 inline int QfnRequest::before_window(int T, int64_t) {
+        runtime_.active_decode_pos = p + T;
         runtime_.drive.d.layers = 0;
         runtime_.drive.d.experts = 0;
         runtime_.drive.d.failed = false;
@@ -474,6 +475,7 @@ inline void QfnRequest::window_timing(int T, int a, bool from_sfx, Clock::time_p
 }
 
 void QfnRequest::decode_end() {
+    runtime_.active_decode_pos = 0;
     if (apply_thr.joinable()) apply_thr.join();
     if (copy_live) runtime_.src.commit_exchanges();   // swaps applied early: the rest of their copies
     copy_live = false;

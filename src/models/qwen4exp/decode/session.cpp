@@ -245,6 +245,65 @@ bool session_host_kv_ensure(SessionState& s, int64_t cell_lo, int64_t cell_hi, s
     return true;
 }
 
+bool session_can_stream(const SessionState& s) {
+    if (s.qsa_states == nullptr || s.qsa_alloc <= 0) return false;
+    for (int64_t j = 0; j < s.qsa_alloc; ++j)
+        if (!qsa_can_stream(s.qsa_states[s.qsa_ord0 + j])) return false;
+    return true;
+}
+
+bool session_is_streamed(const SessionState& s) {
+    return s.qsa_states != nullptr && s.qsa_alloc > 0 && s.qsa_states[s.qsa_ord0].kv_mode == 1;
+}
+
+uint64_t session_host_kv_bytes(const SessionState& s) {
+    uint64_t pages = 0;
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+        const QsaState& q = s.qsa_states[s.qsa_ord0 + j];
+        if (q.kv_mode != 1 || q.host_pool == nullptr) continue;
+        for (int32_t p : q.host_tab.h_pages)
+            if (p >= 0) ++pages;
+    }
+    return pages * HostKvPool::kPageBytes;
+}
+
+bool session_demote_to_stream(SessionState& s, const ModelGeometry& g, int64_t live_cells, std::string& err) {
+    if (!session_can_stream(s)) {
+        err = "session cannot dynamically stream to host RAM";
+        return false;
+    }
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+        if (!qsa_state_demote_to_stream(s.qsa_states[s.qsa_ord0 + j], g, live_cells, err)) {
+            std::string rerr;
+            const int64_t map_back = std::max(live_cells, qsa_kv_resident_min());
+            for (int64_t i = 0; i < j; ++i)
+                (void) qsa_state_promote_to_vram(s.qsa_states[s.qsa_ord0 + i], g, live_cells, map_back, rerr);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool session_promote_to_vram(SessionState& s, const ModelGeometry& g, int64_t live_cells, int64_t map_cells, std::string& err) {
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+        if (!qsa_state_promote_to_vram(s.qsa_states[s.qsa_ord0 + j], g, live_cells, map_cells, err)) {
+            std::string rerr;
+            for (int64_t i = 0; i < j; ++i)
+                (void) qsa_state_demote_to_stream(s.qsa_states[s.qsa_ord0 + i], g, live_cells, rerr);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool session_reset_to_vram(SessionState& s, int64_t floor_cells, std::string& err) {
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        if (!qsa_state_reset_to_vram(s.qsa_states[s.qsa_ord0 + j], floor_cells, err)) return false;
+    for (KvArena* a : s.kv_extra)
+        if (!a->unmap(floor_cells, err)) return false;
+    return true;
+}
+
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
     cudaStream_t cs = (cudaStream_t) stream;
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the

@@ -5,13 +5,175 @@
 namespace basalt::models::qwen4exp::serve {
 
 // the expert cache never shrinks below the slots the prompt path's smallest loan needs (a 256-token chunk, and
-// the 128 slots a loan leaves), so the next prompt can always be read
+// the 128 slots a loan leaves), so the next prompt can always be read (including a streamed session's staging pool)
 int64_t QfnRuntime::cache_floor_slots() {
     if (pf_parts.empty() || pf_parts[0].first < 0) return 0;
-    const int64_t k = part_slots(pf_parts[0], 256);
+    uint64_t need = basalt::prefill::Prefill::bytes_needed(g, *pf_parts[0].ses, 256);
+    if (stages.empty() && basalt::core::session_can_stream(ss) && !basalt::core::session_is_streamed(*pf_parts[0].ses)) {
+        const basalt::core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
+        need += (uint64_t) q0.n_pages * sizeof(basalt::kernels::HostKvPage) + 2048;
+    }
+    const int64_t k = serve_loans::cache_slots_for(*pf_parts[0].cache, need);
     int64_t f = k + 128;
     if (o.prefill_auto) f = std::max<int64_t>(f, (k * 100 + auto_lend_pct - 1) / auto_lend_pct);
     return std::min<int64_t>(f, xcache.full_slots());
+}
+
+int64_t QfnRuntime::live_cells_of(const basalt::core::SessionState& u) const {
+    int64_t n = 0;
+    for (size_t b = 0; !bslot_ss.empty() && b < bslot_ss[0].size() && b < bs.size(); ++b) {
+        if (bslot_ss[0][b]->qsa_states != u.qsa_states) continue;
+        const BSlot& sl = bs[b];
+        if (sl.active) n = std::max<int64_t>(n, sl.p + kKvWindowCells);
+        else if (sl.cached) n = std::max<int64_t>(n, (int64_t) sl.ids.size());
+    }
+    if (rsp != nullptr && rsp->qsa_states == u.qsa_states) {
+        if (live_ok) n = std::max<int64_t>(n, (int64_t) live.size());
+        n = std::max<int64_t>(n, active_decode_pos);
+    }
+    if (ss.qsa_states == u.qsa_states) {
+        if (solo_out != nullptr && solo_out->live_ok) n = std::max<int64_t>(n, (int64_t) solo_out->live.size());
+        else if (!solo_busy && live_ok) n = std::max<int64_t>(n, (int64_t) live.size());
+    }
+    return std::clamp<int64_t>(n, 0, u.max_cells);
+}
+
+std::string QfnRuntime::session_label(const basalt::core::SessionState& u) const {
+    for (size_t b = 0; !bslot_ss.empty() && b < bslot_ss[0].size(); ++b)
+        if (bslot_ss[0][b]->qsa_states == u.qsa_states) return "slot " + std::to_string(b);
+    return "the solo session";
+}
+
+bool QfnRuntime::sync_session_qsa_mode(basalt::core::SessionState& u, std::string& e) {
+    for (size_t b = 0; !bslot_ss.empty() && b < bslot_ss[0].size(); ++b)
+        if (bslot_ss[0][b]->qsa_states == u.qsa_states)
+            if (!ver.update_slot_qsa((int) b, u, e)) return false;
+    ver.invalidate_qsa(u.qsa_states);
+    return true;
+}
+
+bool QfnRuntime::demote_one_to_stream(basalt::core::SessionState& req, int64_t req_cells, bool& demoted, std::string& e) {
+    demoted = false;
+    if (!stages.empty()) return true;
+    const int64_t stream_floor = basalt::core::qsa_kv_resident_min();
+    std::vector<basalt::core::SessionState*> cands = {&ss};
+    for (size_t b = 0; !bslot_ss.empty() && b < bslot_ss[0].size(); ++b)
+        if (bslot_ss[0][b]->qsa_states != ss.qsa_states) cands.push_back(bslot_ss[0][b].get());
+    bool have_req = false;
+    for (const auto* u : cands) have_req = have_req || u->qsa_states == req.qsa_states;
+    if (!have_req) cands.push_back(&req);
+
+    basalt::core::SessionState* best = nullptr;
+    uint64_t best_kv = 0;
+    for (basalt::core::SessionState* u : cands) {
+        if (!basalt::core::session_can_stream(*u) || basalt::core::session_is_streamed(*u)) continue;
+        const uint64_t floor_b = basalt::core::session_kv_only_bytes_for(*u, std::min(u->max_cells, stream_floor));
+        const bool is_req = u->qsa_states == req.qsa_states;
+        const uint64_t kv_b = is_req
+            ? std::max(basalt::core::session_kv_only_mapped_bytes(*u), basalt::core::session_kv_only_bytes_for(*u, req_cells))
+            : basalt::core::session_kv_only_mapped_bytes(*u);
+        if (kv_b <= floor_b) continue;
+        if (best == nullptr || kv_b > best_kv) {
+            best = u;
+            best_kv = kv_b;
+        }
+    }
+    if (best == nullptr) return true;
+
+    const auto t0 = Clock::now();
+    const uint64_t before_b = basalt::core::session_kv_only_mapped_bytes(*best);
+    const int64_t live = live_cells_of(*best);
+    if (!basalt::core::session_demote_to_stream(*best, g, live, e)) {
+        shed_if_low();
+        e.clear();
+        if (!basalt::core::session_demote_to_stream(*best, g, live, e)) return false;
+    }
+    if (!sync_session_qsa_mode(*best, e)) return false;
+    const uint64_t after_b = basalt::core::session_kv_only_mapped_bytes(*best);
+    const double freed_mib = before_b > after_b ? (double) (before_b - after_b) / 1048576.0 : 0.0;
+    basalt::log::info("basalt serve", "KV tier: %s demoted to host RAM streaming (%lld live cells, %.0f MiB VRAM "
+                         "freed in %.1f ms)", session_label(*best).c_str(), (long long) live, freed_mib,
+                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    demoted = true;
+    return true;
+}
+
+bool QfnRuntime::maybe_promote_to_vram(std::string& e) {
+    if (kv_floor <= 0 || !stages.empty() || ov_active) return true;
+    for (const PfPart& p : pf_parts)
+        if (!p.lent.empty()) return true;
+    {
+        std::lock_guard<std::mutex> lk(in_mu);
+        if (!in_lines.empty()) return true;
+    }
+    std::vector<basalt::core::SessionState*> streamed;
+    for (int pass = 0; pass < 2; ++pass) {   // pass 0: active decoding slots first, pass 1: cached / solo
+        for (size_t b = 0; !bslot_ss.empty() && b < bslot_ss[0].size() && b < bs.size(); ++b) {
+            if ((bs[b].active ? 0 : 1) != pass) continue;
+            basalt::core::SessionState* u = bslot_ss[0][b].get();
+            if (basalt::core::session_is_streamed(*u)) streamed.push_back(u);
+        }
+        if (pass == 1 && (bslot_ss.empty() || !slot0_is_solo) && basalt::core::session_is_streamed(ss))
+            streamed.push_back(&ss);
+    }
+    if (streamed.empty()) return true;
+
+    constexpr int64_t kHysteresisBytes = 256ll << 20;
+    for (basalt::core::SessionState* u : streamed) {
+        const int64_t live = live_cells_of(*u);
+        if (live <= 0) {
+            if (!kv_drain(e) || !basalt::core::session_reset_to_vram(*u, kv_floor, e) ||
+                !sync_session_qsa_mode(*u, e) || !cache_regrow(e))
+                return false;
+            kv_ceiling_note();
+            continue;
+        }
+        const int64_t want = std::min<int64_t>(u->max_cells, std::max<int64_t>(live + kKvGrowCells, kv_floor));
+        const uint64_t kv_need = basalt::core::session_kv_only_bytes_for(*u, want);
+        const uint64_t kv_have = basalt::core::session_kv_only_mapped_bytes(*u);
+        const int64_t add = (int64_t) (kv_need > kv_have ? kv_need - kv_have : 0) +
+                            (int64_t) basalt::core::session_kv_grow_bytes(*u, want);
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const int64_t room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+        int64_t spare_cache = 0;
+        if (xcache.segmented()) {
+            const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
+            spare_cache = gran * basalt::program::kv_cache_spare_granules(
+                                     xcache.mapped_bytes(), gran, cache_floor_slots(),
+                                     [&](int64_t keep) { return xcache.slots_after_shrink(keep); });
+        }
+        if (room + spare_cache < add + kHysteresisBytes) continue;
+        const auto t0 = Clock::now();
+        if (!kv_drain(e)) return false;
+        cudaMemGetInfo(&free_b, &total_b);
+        const int64_t room_now = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+        if (add > room_now && xcache.segmented()) {
+            const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
+            const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room_now)) / gran * gran);
+            if (xcache.slots_after_shrink(keep) < cache_floor_slots()) continue;
+            if (batch_on() && !move_routed_below(xcache.slots_after_shrink(keep), "KV promote", e)) return false;
+            if (!xcache.shrink(keep, e)) return false;
+            const int64_t live_sl = xcache.slots();
+            for (size_t i = 0; i < host_res.size(); ++i)
+                if (host_res[i] >= live_sl) {
+                    vram_evicted.emplace_back((int32_t) i, host_res[i]);
+                    host_res[i] = basalt::core::kNotResident;
+                }
+            res_upload();
+            relend();
+        } else if (add > room_now) {
+            continue;
+        }
+        if (!basalt::core::session_promote_to_vram(*u, g, live, want, e) || !sync_session_qsa_mode(*u, e))
+            return false;
+        ++kv_moves;
+        basalt::log::info("basalt serve", "KV tier: %s promoted back to VRAM (%lld live cells in %.1f ms)",
+                          session_label(*u).c_str(), (long long) live,
+                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        kv_ceiling_note();
+    }
+    return true;
 }
 
 // The elastic KV's ceiling: the cells all sessions can back together before the expert cache would go below its
@@ -282,6 +444,7 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
     // the KV of idle conversations whose time is up goes before the expert cache's slots, any idle one's before
     // a refusal
     int64_t parked = 0;
+    bool demoted_any = false;
     auto park = [&](bool any) {
         const int64_t got = add > room ? park_idle(&s, add - room, any, e) : 0;
         if (got > 0) {
@@ -303,6 +466,15 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
             return a <= room || xcache.slots_after_shrink(keep_for(a)) >= floor;
         };
         if (!leaves_floor(cells) && !park(true)) return false;
+        while (!leaves_floor(cells)) {
+            bool demoted = false;
+            if (!demote_one_to_stream(s, cells, demoted, e)) return false;
+            if (!demoted) break;
+            demoted_any = true;
+            cudaMemGetInfo(&free_b, &total_b);
+            room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+            add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
+        }
         if (!leaves_floor(cells)) {
             // the most cells on the 256-cell grid that leave it, down to `min_cells`
             int64_t best = -1;
@@ -347,9 +519,19 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
         // a long prompt's cells take a block of CUDA0's cache: its experts go to the peer; a short request's few
         // are left to the adaptive rounds
         if (cells - had >= kPeerTakeCells && !peer_take(off, e)) return false;
+    } else if (add > room) {
+        while (add > room) {
+            bool demoted = false;
+            if (!demote_one_to_stream(s, cells, demoted, e)) return false;
+            if (!demoted) break;
+            demoted_any = true;
+            cudaMemGetInfo(&free_b, &total_b);
+            room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+            add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
+        }
     }
     if (!basalt::core::session_kv_map(s, cells, e)) { e = "elastic KV: " + e; return false; }
-    if (parked > 0 && !cache_regrow(e)) return false;   // the rest of what they held is the cache's again
+    if ((parked > 0 || demoted_any) && !cache_regrow(e)) return false;   // the rest of what they held is the cache's again
     ++kv_moves;
     basalt::log::info("basalt serve", "elastic KV: %lld cells backed (+%.0f MiB), the expert cache %lld -> %lld "
                          "slots, in %.1f ms", (long long) basalt::core::session_kv_cells(s),
@@ -361,7 +543,23 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
 
 bool QfnRuntime::kv_release(basalt::core::SessionState& s, int64_t cells, std::string& e) {
     if (kv_floor <= 0) return true;
+    const bool reset_empty = cells <= 0;
     cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
+    if (basalt::core::session_is_streamed(s)) {
+        if (reset_empty) {
+            if (!kv_drain(e) || !basalt::core::session_reset_to_vram(s, kv_floor, e) ||
+                !sync_session_qsa_mode(s, e) || !cache_regrow(e))
+                return false;
+            ++kv_moves;
+            kv_ceiling_note();
+            return true;
+        }
+        const int64_t keep_pages = (cells + 3) / 4;
+        for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+            basalt::core::QsaState& q = s.qsa_states[s.qsa_ord0 + j];
+            if (q.host_pool != nullptr) q.host_pool->release_range(q.host_tab, keep_pages, /*keep_spare=*/true);
+        }
+    }
     if (basalt::core::session_kv_bytes_for(s, basalt::core::session_kv_cells(s)) <=
         basalt::core::session_kv_bytes_for(s, cells)) return true;
     const auto t0 = Clock::now();

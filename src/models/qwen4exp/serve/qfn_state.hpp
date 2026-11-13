@@ -310,6 +310,8 @@ private:
     std::vector<const float*> row_ptr{};
     std::vector<std::pair<int32_t, int32_t>> vram_evicted{};   // (residency index, slot) the shrinks took
     int64_t chunk_full{};
+    int64_t prefill_stage_cells{};
+    int64_t active_decode_pos{};
     int64_t kKvGrowCells{};
     static constexpr int64_t kKvWindowCells = 2* basalt::kernels::kVerifyMaxT + 64;   // a decoding session's next window
     static constexpr int64_t kPeerTakeCells = 32768;   // a fit backing this many new cells hands its experts to the peer
@@ -419,6 +421,11 @@ private:
     bool peer_due_apply(std::string& e);
     bool kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink = true, int64_t min_cells = -1);
     bool kv_release(basalt::core::SessionState& s, int64_t cells, std::string& e);
+    int64_t live_cells_of(const basalt::core::SessionState& u) const;
+    std::string session_label(const basalt::core::SessionState& u) const;
+    bool sync_session_qsa_mode(basalt::core::SessionState& u, std::string& e);
+    bool demote_one_to_stream(basalt::core::SessionState& req, int64_t req_cells, bool& demoted, std::string& e);
+    bool maybe_promote_to_vram(std::string& e);
     uint64_t row_hash(int t);
     bool kv_give_back(int64_t ss_keep, const basalt::core::SessionState* skip, int skip_slot, const std::function<bool()>& enough, int64_t& given, std::string& e);
     std::vector<std::pair<double, int>> idle_list(const basalt::core::SessionState* s, bool any);

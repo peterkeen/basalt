@@ -352,6 +352,10 @@ public:
     bool bind_session(SessionState* s, std::string& err);
     /// Captures every solo window width's graph and the commit for session `s` now.
     bool warm_session(SessionState* s, std::string& err);
+    /// Updates batch slot `slot`'s device QsaSegSlot entries after a dynamic `kv_mode` `0 <-> 1` transition (no graph recapture).
+    bool update_slot_qsa(int slot, const SessionState& s, std::string& err);
+    /// Drops cached solo window graphs referencing `qsa_states` so the next solo window recaptures for its new `kv_mode`.
+    void invalidate_qsa(const QsaState* qsa_states);
 
     // ---- PIPELINED WINDOWS (a layer split of two stages with two chains of verifiers over the same sessions, A and B).
     // Window A runs; once its stage 0 is done, stage 0 commits A as if every row were kept (the state it reaches when the
