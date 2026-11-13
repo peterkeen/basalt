@@ -368,6 +368,36 @@ int main() {
         CHECK(got.live.ids.size() == ids.size() && same_state(got.live, src.live));
     }
     {
+        // A paused reply keeps its exact live end even when its turn checkpoint is close behind it.
+        const std::string d2 = dir + "-paused";
+        std::vector<int32_t> paused_ids = ids;
+        paused_ids.insert(paused_ids.end(), 257, 91);
+        const SavedConversation paused = image(paused_ids, {4096, ids.size()});
+        std::string err;
+        {
+            ConversationStore st;
+            st.set_row_cells(4);
+            CHECK(st.open(d2, id, 1ull << 30, err));
+            SavedConversation copy = paused;
+            CHECK(st.put(std::move(copy), 1ull << 30, /*keep_live=*/true));
+            st.flush();
+            CHECK(st.holds(paused_ids, {}, true));
+        }
+        {
+            ConversationStore st;
+            st.set_row_cells(4);
+            CHECK(st.open(d2, id, 1ull << 30, err));
+            auto p = paused_ids;
+            p.push_back(7);
+            const auto m = st.best(p.data(), p.size(), {}, true);
+            CHECK(m.tokens == (int64_t) paused_ids.size());
+            SavedConversation got;
+            CHECK(st.load(m, got, err));
+            check_cut(got, paused, (int64_t) paused_ids.size(), paused.live);
+        }
+        remove_dir(d2);
+    }
+    {
         // one changed payload byte of a shared block: the read fails, the conversation and the block go
         std::vector<basalt::platform::DirFile> files;
         CHECK(basalt::platform::list_files(dir, files));

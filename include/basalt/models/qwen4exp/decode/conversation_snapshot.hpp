@@ -17,7 +17,7 @@ size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int6
 // Equal token IDs alone do not establish that its K/V bytes are unchanged.
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
-                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr);
+                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr, bool borrow_host = false);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                    int64_t upto, bool include_index, size_t& bytes, std::string& error);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
@@ -116,14 +116,16 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
 // only).  A layer split's later stages park this way; the draft ring is saved once, with the first stage's image.
 // An image is validated and restored with the same kind of call it was saved with (a K/V layer count mismatch is
 // rejected as invalid).
+// `borrow_host`: disk-spill images borrow immutable host KV until the caller flushes the store. The estimate
+// counts only their page directories and owned state, rather than allocating a second copy of the host KV.
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& session, const ModelGeometry& g,
-                                 const QsaState* draft, size_t& bytes, std::string& error);
+                                 const QsaState* draft, size_t& bytes, std::string& error, bool borrow_host = false);
 bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const ConversationView& view,
                                          const SessionState& session, const ModelGeometry& g, const QsaState* draft,
                                          size_t& bytes, std::string& error);
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
-                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr, bool borrow_host = false);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,

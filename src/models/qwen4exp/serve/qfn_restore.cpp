@@ -196,6 +196,10 @@ Flow QfnRequest::restore_image() {
             }
             if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return Flow::error; }
         }
+        if (restored && slot_b >= 0 && basalt::core::exp_flag("concur5_digest", 0) == 2) {
+            if (in_slot) slot_state_back(slot_b);
+            runtime_.note_slot_digest(slot_b, (int64_t) incoming->live.ids.size(), "restored");
+        }
         if (!restored) {
             basalt::log::warn("basalt serve", "conversation cache: restoring a parked conversation failed%s "
                          "(%s); reading the prompt from the start",

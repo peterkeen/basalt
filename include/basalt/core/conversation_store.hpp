@@ -74,7 +74,8 @@ public:
 
     /// Queues `image` for writing; the writer thread owns it from here.  Files it supersedes (the same conversation
     /// a turn back) are dropped.  False when the queue is over its byte cap (nothing queued).
-    bool put(SavedConversation&& image, uint64_t queue_cap);
+    /// `keep_live`: retain the exact live end for a paused request, rather than its last turn checkpoint.
+    bool put(SavedConversation&& image, uint64_t queue_cap, bool keep_live = false);
 
     /// Whether an image with these live tokens is stored or queued.
     bool holds(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const;

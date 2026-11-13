@@ -430,7 +430,8 @@ private:
     bool kv_give_back(int64_t ss_keep, const basalt::core::SessionState* skip, int skip_slot, const std::function<bool()>& enough, int64_t& given, std::string& e);
     std::vector<std::pair<double, int>> idle_list(const basalt::core::SessionState* s, bool any);
     int64_t park_idle(const basalt::core::SessionState* s, int64_t need, bool any, std::string& e);
-    bool park_one(int b, std::string& e);
+    bool park_one(int b, std::string& e, bool to_disk = false);
+    bool preempt_if_low(std::string& e);
     bool park_idle_engine(std::string& e) override;
     void enc_command(const std::string& cmd) override;
     bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) override;
@@ -438,6 +439,7 @@ private:
     bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) override;
     void solo_draft_back(bool keep) override;
     bool slot_digest(int b, int64_t upto, uint64_t* part);
+    void note_slot_digest(int b, int64_t upto, const char* where);
     bool batch_step();
     basalt::core::Verifier& stage_verifier(int k);
     bool pipe_inflight();

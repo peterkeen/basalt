@@ -981,7 +981,11 @@ class ProcessEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress = None
         self._reset_windows()
-        keys = self.sampling_keys(sampling or {})
+        # Every run of this reply uses the same seed, including a RAM-preempted run without a client seed.
+        sampling = dict(sampling or {})
+        if sampling.get("seed") is None:
+            sampling["seed"] = int.from_bytes(os.urandom(8), "little")
+        keys = self.sampling_keys(sampling)
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -993,6 +997,7 @@ class ProcessEngine:
             return
         holding, born = True, self.gen                  # born: engine generation holding the control lines
         slot, gen0, reserved = None, None, None
+        resume_slot = None                               # a disk retry keeps its batch path
         solo_slot, run0 = None, 0
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
@@ -1014,7 +1019,8 @@ class ProcessEngine:
                     # would copy its conversation into slot 0 over the one that slot holds) and a lone request is a
                     # batch of one.
                     any_slot = bool(self.info.get("solo_any_slot"))
-                    alone = not any(self.slot_busy) and self.waiting == 0 and (any_slot or not self.info.get("slot0_solo"))
+                    alone = (resume_slot is None and not any(self.slot_busy) and self.waiting == 0
+                             and (any_slot or not self.info.get("slot0_solo")))
                     if alone and left > 1 and any_slot:
                         solo_slot = self.pick_slot(prompt, session)   # the slot holding the longest start, else a free one
                         if solo_slot is None:
@@ -1086,7 +1092,14 @@ class ProcessEngine:
                             ticket = self.admission.join()
                             try:
                                 while True:
-                                    slot = self.pick_slot(prompt, session)
+                                    if resume_slot is not None:
+                                        # The aliased solo slot's admission takes a solo window. A paused batch
+                                        # request must continue directly in batch windows, without that extra pass.
+                                        free = [b for b in self.slot_order if not self.slot_busy[b]
+                                                and (b != 0 or not self.info.get("slot0_solo"))]
+                                        slot = resume_slot if resume_slot in free else next(iter(free), None)
+                                    else:
+                                        slot = self.pick_slot(prompt, session)
                                     if slot is not None and self.admission.may_go(ticket, self._resumes(slot, prompt)):
                                         self.slot_busy[slot] = True
                                         self.claim_slot(slot, session)
@@ -1196,7 +1209,13 @@ class ProcessEngine:
                         self._bdone_last(f)
                         # the slot holds the prompt and every token fed (all but the last)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
-                        again = (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
+                        preempted = f[3:4] == ["preempt"]
+                        if preempted:
+                            resume_slot = slot
+                            solo_again = self.SOLO_AGAIN_MAX
+                            self.slot_held[slot] = []    # its state is on disk, not in this slot
+                        again = ((preempted or (going_solo and f[3:4] == ["cancel"]))
+                                 and not cancel.is_set() and len(out) < int(max_new)
                                  and not (out and out[-1] in self.eos_ids()))
                         self._carry_run(carry, first, last0, not again)
                         if again:
@@ -1207,7 +1226,24 @@ class ProcessEngine:
                                 self.slot_cv.notify_all()
                             slot, gen0 = None, None
                             prompt, left = list(ids) + out, int(max_new) - len(out)
-                            solo_again += 1
+                            if preempted:
+                                # Do not immediately recreate the contention that just parked us. Wait without
+                                # holding a slot or the control lines, still serving heartbeats and cancellation.
+                                beat = time.monotonic()
+                                while True:
+                                    with self.slot_cv:
+                                        if not any(self.slot_busy) or cancel.is_set():
+                                            break
+                                        self.slot_cv.wait(timeout=0.5)
+                                    if not self.alive():
+                                        raise EngineDied("the engine stopped while this request was parked")
+                                    if time.monotonic() - beat >= 10.0:
+                                        beat = time.monotonic()
+                                        yield None
+                                if cancel.is_set():
+                                    return
+                            else:
+                                solo_again += 1
                             break
                         return
         finally:

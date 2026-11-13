@@ -1062,7 +1062,7 @@ void keep_stored_checkpoints(std::vector<ConversationCheckpoint>& v) {
 
 }  // namespace
 
-bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
+bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap, bool keep_live) {
     if (!open_ || image.live.ids.empty() || !image.stage_images.empty()) return false;
     keep_stored_checkpoints(image.checkpoints);
     for (const auto& c : image.checkpoints)
@@ -1073,7 +1073,7 @@ bool ConversationStore::put(SavedConversation&& image, uint64_t queue_cap) {
     // reply sent back as it was is read again), whose state file then stands in for the live state.
     size_t deepest = 0;
     for (const auto& c : image.checkpoints) deepest = std::max(deepest, c.ids.size());
-    if (deepest >= 2 && deepest < image.live.ids.size() && image.live.ids.size() - deepest <= (size_t) kLiveSlack) {
+    if (!keep_live && deepest >= 2 && deepest < image.live.ids.size() && image.live.ids.size() - deepest <= (size_t) kLiveSlack) {
         image.live.ids.resize(deepest);
         image.live.imgs = imgs_below(image.live.imgs, (int64_t) deepest);
         image.live.state_a = {};

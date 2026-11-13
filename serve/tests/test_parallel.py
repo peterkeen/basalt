@@ -67,10 +67,20 @@ def reply(ids):            # the rest of the reply after what the prompt already
     return R[k:]
 active = {}          # slot -> [tokens left, max_new, produced]
 stopped = set()      # BSTOPped slots: they end "cancel"
+preempted = False
 def window():        # one batch window: every active slot one token
     if fail and len(active) >= 2:     # as the engine: the reason on stdout, then exit code 1
         print("ERR verify batch: layer 34 never rang (graph finished)", flush=True)
         sys.exit(1)
+    global preempted
+    if "--preempt" in args and not preempted and len(active) >= 2:
+        b = min(active)
+        if active[b][2] >= 6:
+            preempted = True
+            print(f"BDONE {b} {active[b][2]} preempt 1.0 0 0", flush=True)
+            if log:
+                log.write(f"PREEMPT {b}\n"); log.flush()
+            del active[b]
     for b in sorted(active):
         left, max_new, produced = active[b]
         got = []
@@ -118,6 +128,8 @@ while True:
             continue
         if log:
             log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}\n"); log.flush()
+            if "--preempt" in args:
+                log.write("KEYS " + " ".join(x for x in f if "=" in x) + "\n"); log.flush()
         toks = reply(ids)
         reused = min(max([lcp([int(x) for x in ids], h) for h in held], default=0), len(ids) - 1) if keep else 0
         if s0:
@@ -219,7 +231,7 @@ class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False,
-              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False):
+              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False, preempt=False):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -237,6 +249,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--slot0solo"] if slot0_solo else []
         extra += ["--soloany"] if solo_any else []
         extra += ["--pms"] if pms else []
+        extra += ["--preempt"] if preempt else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -332,6 +345,68 @@ class ParallelService(unittest.TestCase):
         go(second)
         a.join(30)
         return res
+
+    def test_ram_preemption_resumes_the_same_reply_after_competitors_finish(self):
+        self.start(2, preempt=True, multi=1, slot0_solo=True, solo_any=True, slot_cache=True)
+        self.engine.SOLO_AGAIN_MAX = 0
+        out = self.race("first LONGREPLY", "second LONGREPLY", delay=0.08)
+        for reply, _ in out.values():
+            self.assertEqual(reply, "ok, " + "la " * 15 + "done.")
+        lines = self.log.read_text().splitlines()
+        self.assertEqual(sum(x.startswith("PREEMPT") for x in lines), 1, lines)
+        # The retry starts only once the competing slot has finished.
+        at = next(i for i, x in enumerate(lines) if x.startswith("PREEMPT"))
+        retry = next(x for x in lines[at + 1:] if x.startswith(("GEN ", "BGEN ", "SGEN ")))
+        self.assertEqual(retry.split()[3], "0", lines)
+        self.assertTrue(retry.startswith("BGEN 1 "), lines)   # no solo-admission window on a disk retry
+        keys = [x for x in lines if x.startswith("KEYS ")]
+        self.assertTrue(all("seed=" in x for x in keys), keys)
+        self.assertEqual(keys[0], keys[-1])   # automatic seed survives solo / batch / disk retries
+        self.assertFalse(any(self.engine.slot_busy))
+        self.assertEqual(len(self.svc.history), 2)
+
+    def test_a_cancelled_parked_request_does_not_get_readmitted(self):
+        self.start(2, preempt=True, multi=1)
+        self.engine.info["slot0_solo"] = 1   # keep both requests on the batch path
+        self.engine.SOLO_AGAIN_MAX = 0
+        parked = threading.Event()
+        original = self.engine._bdone_last
+
+        def note(fields):
+            original(fields)
+            if fields[3:4] == ["preempt"]:
+                parked.set()
+        self.engine._bdone_last = note
+        cancels = [threading.Event(), threading.Event()]
+        out, errors = {}, []
+
+        def run(b):
+            try:
+                ids = list(f"question {b} LONGREPLY".encode())
+                out[b] = [t for t in self.engine.generate(ids, 64, {"temperature": 0.7, "seed": 42}, cancels[b])
+                          if t is not None]
+            except Exception as e:
+                errors.append(e)
+        threads = [threading.Thread(target=run, args=(b,)) for b in range(2)]
+        for th in threads:
+            th.start()
+        self.assertTrue(parked.wait(10))
+        # Slot zero is the fake engine's victim. Its consumer remains alive, but no longer holds that slot.
+        deadline = time.time() + 2
+        while self.engine.slot_busy[0] and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(self.engine.slot_busy[0])
+        cancels[0].set()
+        for th in threads:
+            th.join(10)
+        self.assertFalse(any(th.is_alive() for th in threads))
+        self.assertEqual(errors, [])
+        self.assertTrue(0 < len(out[0]) < len(out[1]))
+        self.assertEqual(bytes(out[1][:-1]).decode(), "ok, " + "la " * 15 + "done.")
+        self.assertFalse(any(self.engine.slot_busy))
+        lines = self.log.read_text().splitlines()
+        self.assertEqual(sum(x.startswith("BGEN ") for x in lines), 2, lines)
+        self.assertTrue(all("seed=42" in x for x in lines if x.startswith("KEYS ")))
 
     def test_a_long_prompt_gives_way_to_a_short_one(self):
         """A long solo prompt read gives way at a chunk boundary to a short request, then continues and is answered."""

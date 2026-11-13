@@ -1,6 +1,9 @@
 // Dynamic QSA tier changes and prefix copies preserve every authoritative byte.
 #include "basalt/models/qwen4exp/decode/conversation_snapshot.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
+#include "basalt/core/conversation_store.hpp"
+#include "basalt/platform/file.hpp"
+#include "basalt/platform/system.hpp"
 #include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
 #include <cuda_runtime.h>
 
@@ -124,6 +127,74 @@ int main() {
         a.fill(177);
         check(conversation_kv_copy(b.st, a.st, a.g, live, true, err), "streamed to resident", err);
         verify(image, a, live);
+        // CPU snapshots survive disk park/restore and registration cycles without touching resident K/V.
+        const std::string dir = basalt::platform::temp_dir() + "/basalt-kv-spill-" +
+                                std::to_string(basalt::platform::file_time_now());
+        {
+            ConversationStore disk;
+            disk.set_row_cells(4);
+            check(disk.open(dir, 0x5a17, 1ull << 30, err), "open spill store", err);
+            for (int round = 0; round < 3; ++round) {
+                qsa_host_kv_pool().unregister_all();
+                check(qsa_host_kv_pool().pinned_bytes() == 0, "sleep drops KV registration");
+                check(qsa_host_kv_pool().register_all(err), "wake registers KV slabs", err);
+                verify(image, b, live);
+                SavedConversation saved;
+                saved.geometry.fill(1);
+                saved.layer_hi = 1;
+                saved.live.ids.assign((size_t) live, 17);
+                check(conversation_kv_save(saved.kv.emplace_back(), b.st, b.g, live, true, err, 0, nullptr,
+                                           /*borrow_host=*/true), "borrow host snapshot", err);
+                if (round == 0) {
+                    auto* hp = b.st.host_pool->page_ptr(b.st.host_tab.h_pages[0]);
+                    const int8_t before = hp->k_q[0];
+                    hp->k_q[0] ^= 1;
+                    uint8_t got = 0;
+                    check(saved.kv[0].k.read(&got, 0, 1) && got == (uint8_t) hp->k_q[0], "spill borrows original KV");
+                    hp->k_q[0] = before;
+                    ConversationBuffer owned = saved.kv[0].k;
+                    owned.resize(owned.size());
+                    check(owned == saved.kv[0].k, "borrowed buffer materializes on write");
+                    owned.resize(7);
+                    check(owned.size() == 7 && saved.kv[0].k.size() > 7, "borrowed copy resizes independently");
+                }
+                SavedConversation branch;
+                if (round == 0) {
+                    branch = saved;
+                    branch.live.ids[8192] = 19;
+                }
+                check(disk.put(std::move(saved), 1ull << 30, true), "queue spill", err);
+                disk.flush();
+                if (round == 0) {
+                    auto blocks = [&] {
+                        std::vector<basalt::platform::DirFile> entries;
+                        check(basalt::platform::list_files(dir, entries), "list shared blocks");
+                        return std::count_if(entries.begin(), entries.end(), [](const auto& f) {
+                            return f.name.size() > 18 && f.name[17] == 'b';
+                        });
+                    };
+                    check(blocks() == 6, "six complete blocks in original spill");
+                    check(disk.put(std::move(branch), 1ull << 30, true), "spill prefix branch", err);
+                    disk.flush();
+                    check(blocks() == 10, "shared-prefix branch reuses its first two block files");
+                }
+                check(qsa_state_reset_to_vram(b.st, 4096, err), "park releases host KV", err);
+                check(qsa_host_kv_pool().pinned_bytes() == 0, "park frees every slab");
+                std::vector<int32_t> prompt((size_t) live + 1, 17);
+                const auto match = disk.best(prompt.data(), prompt.size(), {}, true);
+                check(match.tokens == live, "disk keeps exact live end");
+                SavedConversation restored;
+                check(disk.load(match, restored, err), "load spilled snapshot", err);
+                check(qsa_state_demote_to_stream(b.st, b.g, 0, err), "restore into streamed session", err);
+                check(b.st.idx_arena->map(live + 1, err), "back restored indexer", err);
+                check(conversation_kv_restore(restored.kv[0], b.st, b.g, live, true, err), "restore spilled KV", err);
+                verify(image, b, live);
+            }
+        }
+        std::vector<basalt::platform::DirFile> files;
+        check(basalt::platform::list_files(dir, files), "list spill files");
+        for (const auto& f : files) check(basalt::platform::remove_file(dir + "/" + f.name), "remove spill file");
+        check(basalt::platform::remove_file(dir), "remove spill directory");
         check(qsa_state_reset_to_vram(b.st, 4096, err), "discard streamed session", err);
         check(qsa_host_kv_pool().pinned_bytes() == 0, "discard frees all slabs");
     }

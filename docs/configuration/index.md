@@ -102,6 +102,13 @@ in VRAM; the indexer stays resident. At request boundaries, sessions return to V
 256 MiB margin. Automatic transitions require a single-card prompt path (no prompt or layer split); peer expert
 tiers are supported. Other KV formats keep their existing storage path.
 
+With elastic KV and the disk conversation cache enabled, low RAM can park a competing streamed request to `.bcs`
+after at least 256 generated tokens. The server waits for the other active requests to finish, then resumes on the
+same HTTP stream with the same sampling seed and batch verifier path. Disk parking reads host K/V in place and
+copies only the running state and indexer, leaving the hard safety floor free; state is released only after the
+write succeeds. Without enough snapshot headroom or a usable disk tier, active state is retained. `SLEEP` parks idle sessions and unregisters any remaining host-KV slabs; `WAKE`
+registers them again.
+
 ## Expert cache and memory
 
 | Setting | Where | Type, values | Default | What it does |

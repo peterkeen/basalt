@@ -39,6 +39,9 @@ if (line.rfind("PROBE set ", 0) == 0) {   // PROBE set workers=K share=F: live v
                 const double v = eq == std::string::npos ? -1.0 : std::atof(kv.c_str() + eq + 1);
                 if (key == "workers" && v >= 1) pool.set_active_workers((int) v);
                 else if (key == "share" && v >= 0 && v <= 1) sp.set_cpu_share(v);
+                // Allocation/preemption diagnostic only; the running guard keeps its original safety floor.
+                else if (key == "ram_reserve_mib" && v >= 0 && v <= 1048576)
+                    basalt::platform::set_ram_reserve((uint64_t) v << 20);
                 else perr = "PROBE: bad setting " + kv;
             }
             if (perr.empty()) std::printf("PROBE end workers=%d\n", pool.active_workers());
@@ -69,6 +72,9 @@ void QfnRuntime::sleep_command(bool down, std::string& verr) {
     // both caches refill from the ranges already back.  A tier or a registration that cannot come back
     // fails WAKE: the server then starts the engine again.
     std::string perr, reply, uerr;
+    if (down) {
+        if (!kv_drain(verr) || park_idle(nullptr, INT64_MAX, /*any=*/true, verr) < 0) return;
+    } else if (!basalt::core::qsa_host_kv_pool().register_all(verr)) return;
     const auto tp = Clock::now();
     const bool repin = !down && src.complement_unpinned();
     std::function<bool(const void*, uint64_t)> ready;
@@ -83,6 +89,7 @@ void QfnRuntime::sleep_command(bool down, std::string& verr) {
         basalt::log::info("basalt serve", "WAKE: the RAM copy registered again beside the caches' refill "
                           "in %.0f ms", std::chrono::duration<double, std::milli>(Clock::now() - tp).count());
     }
+    if (down && verr.empty()) basalt::core::qsa_host_kv_pool().unregister_all();
     if (down && verr.empty() && src.complement_ready()) {
         const auto tu = Clock::now();
         if (src.unpin_complement(uerr))

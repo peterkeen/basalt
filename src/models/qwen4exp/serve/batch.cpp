@@ -30,6 +30,7 @@ uint64_t QfnRuntime::row_hash(int t) {
 // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
 // so it keeps the conversation it holds
 bool QfnRuntime::batch_step() {
+    if (!preempt_if_low(err)) { std::printf("ERR %s\n", err.c_str()); return false; }
     constexpr int MR = basalt::kernels::kVerifyMaxT;
     const int MB = std::min(MR, ver.max_t());   // the row budget is this verifier capacity; MR only sizes the arrays
     int S = 0, R = 0;
@@ -451,7 +452,7 @@ int QfnRuntime::init_batch() {
     bt_dr_off = 0;
     bt_dr_acc = 0;
     bscript = std::vector<std::pair<std::vector<int32_t>, uint64_t>>((size_t) std::max(o.batch, 0));
-    bdigest = basalt::core::exp_flag("concur5_digest", 0) != 0;
+    bdigest = basalt::core::exp_flag("concur5_digest", 0) == 1;
     // concur9_logit_hash: a hash of the head logits of every accepted row, on stderr (solo and batch alike)
     logit_hash = basalt::core::exp_flag("concur9_logit_hash", 0) != 0;
 

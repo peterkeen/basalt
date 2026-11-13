@@ -285,7 +285,8 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
 }
 
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,
-                                 const ModelGeometry& g, const QsaState* draft, size_t& bytes, std::string& error) {
+                                 const ModelGeometry& g, const QsaState* draft, size_t& bytes, std::string& error,
+                                 bool borrow_host) {
     bytes = 0;
     if (!view_validate(view, ss, g, error)) return false;
     ConversationStateSizes z;
@@ -305,8 +306,14 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
     const int64_t upto = (int64_t) view.ids.size(); // view_validate bounds this by signed max_cells
     for (uint64_t i = 0; i < qsa + (draft ? 1 : 0); ++i) {
         const auto& st = i == qsa ? *draft : owned(ss, (size_t) i);
-        const size_t n = conversation_kv_bytes(st, g, upto, i != qsa);
-        if (!n || !add(bytes, n)) return fail(error, "invalid or overflowing K/V byte estimate");
+        size_t n = conversation_kv_bytes(st, g, upto, i != qsa);
+        if (!n) return fail(error, "invalid K/V byte estimate");
+        if (borrow_host && st.kv_mode == 1 && st.host.paged.present()) {
+            const size_t pages = (size_t) ((upto + 3) / 4);
+            n -= pages * sizeof(basalt::kernels::HostKvPage);
+            n += pages * 4 * sizeof(const uint8_t*);
+        }
+        if (!add(bytes, n)) return fail(error, "overflowing K/V byte estimate");
     }
     return true;
 }
@@ -339,7 +346,7 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState* draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes) {
+                                ConversationKvReuse reuse, size_t* reused_bytes, bool borrow_host) {
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
     // Build into a new object so a failure cannot publish a partial snapshot.
@@ -356,7 +363,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     const int64_t upto = (int64_t) view.ids.size();
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
-                                  unchanged, reused_bytes)) return false;
+                                  unchanged, reused_bytes, borrow_host)) return false;
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.
     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,

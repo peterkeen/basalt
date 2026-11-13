@@ -125,6 +125,23 @@ void QfnRuntime::solo_draft_back(bool keep) {
         basalt::log::warn("basalt serve", "the solo conversation's draft K/V: %s", e.c_str());
 }
 
+void QfnRuntime::note_slot_digest(int b, int64_t upto, const char* where) {
+    if (basalt::core::exp_flag("concur5_digest", 0) != 2 || b < 0) return;
+    uint64_t part[10] = {};
+    if (!slot_digest(b, upto, part)) {
+        basalt::log::warn("basalt serve", "KV digest: %s slot %d failed", where, b);
+        return;
+    }
+    std::string hashes;
+    for (uint64_t h : part) {
+        char hex[18];
+        std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long) h);
+        hashes += (hashes.empty() ? "" : ",") + std::string(hex);
+    }
+    basalt::log::info("basalt serve", "KV digest: %s slot %d cells %lld %s", where, b,
+                      (long long) upto, hashes.c_str());
+}
+
 // hashes of everything slot b's sessions hold for its first `upto` tokens, per part (GDN state, PLE history,
 // indexer tails, dead rows, block positions, K, V, scales, pooled rows), for comparing a slot's state window by
 // window against another run of the same request

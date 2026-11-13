@@ -10,9 +10,8 @@
 
 namespace basalt::core {
 
-// Snapshot-owned host storage. Appending never relocates existing payloads;
-// only the small segment directory can move. No sharing or copy-on-write is
-// needed because a parked image and its retained active buffers have one owner.
+// Snapshot-owned host storage. Appending never relocates existing payloads; only the segment directory moves.
+// A synchronous disk spill can borrow immutable pages instead, without allocating another copy of its payload.
 class ConversationBuffer {
 public:
     static constexpr size_t segment_bytes = 16 * 1024 * 1024;
@@ -27,20 +26,35 @@ public:
     ConversationBuffer(const ConversationBuffer&) = default;
     ConversationBuffer& operator=(const ConversationBuffer&) = default;
     ConversationBuffer(ConversationBuffer&& other) noexcept
-        : segments_(std::move(other.segments_)), size_(std::exchange(other.size_, 0)) {}
+        : segments_(std::move(other.segments_)), size_(std::exchange(other.size_, 0)),
+          pages_(std::move(other.pages_)), page_bytes_(std::exchange(other.page_bytes_, 0)) {}
     ConversationBuffer& operator=(ConversationBuffer&& other) noexcept {
         if (this == &other) return *this;
         segments_ = std::move(other.segments_);
         size_ = std::exchange(other.size_, 0);
+        pages_ = std::move(other.pages_);
+        page_bytes_ = std::exchange(other.page_bytes_, 0);
         return *this;
     }
 
     size_t size() const { return size_; }
     bool empty() const { return size_ == 0; }
     size_t bytes() const {
-        size_t n = segments_.capacity() * sizeof(Segment);
+        // Disk queue and disk-space budgets charge borrowed payloads too.
+        size_t n = segments_.capacity() * sizeof(Segment) + pages_.capacity() * sizeof(const uint8_t*);
+        if (page_bytes_) n += size_;
         for (const auto& segment : segments_) n += segment.capacity();
         return n;
+    }
+    // Read-only pages for a synchronous disk spill. The caller keeps them alive and immutable until flush().
+    // A write materializes owned storage; copies of a borrowed buffer retain the same lifetime requirement.
+    bool borrow_pages(std::vector<const uint8_t*> pages, size_t page_bytes) {
+        if (!page_bytes || pages.size() > SIZE_MAX / page_bytes) return false;
+        *this = ConversationBuffer{};
+        size_ = pages.size() * page_bytes;
+        pages_ = std::move(pages);
+        page_bytes_ = page_bytes;
+        return true;
     }
     // Includes the old directory while reserve allocates its replacement.
     // Saturation makes an overflowing estimate fail admission before resize.
@@ -66,10 +80,19 @@ public:
 
     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) {
+        own();
         return visit_impl(*this, offset, count, fn);
     }
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) const {
-        return visit_impl(*this, offset, count, fn);
+        if (!page_bytes_) return visit_impl(*this, offset, count, fn);
+        if (offset > size_ || count > size_ - offset) return false;
+        while (count) {
+            const size_t page = offset / page_bytes_, at = offset % page_bytes_;
+            const size_t n = std::min(count, page_bytes_ - at);
+            if (!fn(pages_[page] + at, n, offset)) return false;
+            offset += n; count -= n;
+        }
+        return true;
     }
     bool read(void* target, size_t offset, size_t count) const {
         return visit(offset, count, [&](const uint8_t* p, size_t n, size_t at) {
@@ -79,6 +102,14 @@ public:
     }
     bool operator==(const ConversationBuffer& other) const {
         if (size_ != other.size_) return false;
+        if (page_bytes_ || other.page_bytes_) {
+            uint8_t a[4096], b[4096];
+            for (size_t at = 0; at < size_; at += sizeof a) {
+                const size_t n = std::min(sizeof a, size_ - at);
+                if (!read(a, at, n) || !other.read(b, at, n) || std::memcmp(a, b, n)) return false;
+            }
+            return true;
+        }
         size_t a = 0, b = 0, x = 0, y = 0;
         while (a < segments_.size() && b < other.segments_.size()) {
             const auto& left = segments_[a];
@@ -103,7 +134,15 @@ private:
         template <class U, class... A> void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
     };
     using Segment = std::vector<uint8_t, NoInit<uint8_t>>;
+    void own() {
+        if (!page_bytes_) return;
+        ConversationBuffer copy;
+        copy.resize_for_overwrite(size_);
+        copy.visit(0, size_, [&](uint8_t* p, size_t n, size_t at) { return read(p, at, n); });
+        *this = std::move(copy);
+    }
     void grow_or_shrink(size_t n, const uint8_t* value) {
+        own();
         if (n > size_) {
             const bool growing = size_ != 0;
             const size_t spare = segments_.empty() ? 0 : segments_.back().capacity() - segments_.back().size();
@@ -163,6 +202,8 @@ private:
     }
     std::vector<Segment> segments_;
     size_t size_ = 0;
+    std::vector<const uint8_t*> pages_;
+    size_t page_bytes_ = 0;
 };
 
 } // namespace basalt::core

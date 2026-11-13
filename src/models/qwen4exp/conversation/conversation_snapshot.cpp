@@ -163,7 +163,7 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
 
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
-                          int64_t unchanged_tokens, size_t* reused_bytes) {
+                          int64_t unchanged_tokens, size_t* reused_bytes, bool borrow_host) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error) || !backed(st, l, error)) return false;
@@ -202,6 +202,16 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / basalt::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
+        if (borrow_host && paged_host && i < 4 && n1 > 0) {
+            std::vector<const uint8_t*> pages((size_t) n1);
+            for (int64_t page = 0; page < n1; ++page) {
+                const int32_t phys = st.host_tab.h_pages[(size_t) page];
+                pages[(size_t) page] = phys >= 0 ? page_slice(st.host_pool->page_ptr(phys), i) : nullptr;
+                if (!pages[(size_t) page]) { error = "conversation snapshot: unallocated spill page"; return false; }
+            }
+            if (!dst[i]->borrow_pages(std::move(pages), sizes[i] / (size_t) n1)) return false;
+            continue;
+        }
         dst[i]->resize_for_overwrite(sizes[i]);   // every new byte is copied in below
         if (paged_host && i < 4 && sizes[i] > 0 && n1 > 0) {
             // Direct CPU read from `HostKvPool` pages: zero GPU D2H traffic for K/V.

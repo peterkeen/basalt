@@ -80,7 +80,8 @@ Flow Runtime::dispatch() {
     }
     if (line.rfind("PROBE", 0) == 0) {   // between requests, not a request (basalt-probe's commands)
         std::string perr;
-        if (batch_on()) perr = "PROBE: not while batch slots are decoding";
+        if (batch_on() && line.rfind("PROBE set ram_reserve_mib=", 0) != 0)
+            perr = "PROBE: not while batch slots are decoding";
         else probe_command(line, perr);
         if (!perr.empty()) std::printf("ERR %s\n", perr.c_str());
         std::fflush(stdout);
