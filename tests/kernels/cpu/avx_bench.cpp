@@ -143,6 +143,11 @@ int main(int argc, char** argv) {
         ops.push_back({g.name, "avx512", bytes, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::iq512_gu_rows(type, b, row, up, NH, pk, NT, ff, r0, r1); }, bytes});
         ops.push_back({g.name, "avx2", bytes, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::iq256_gu_rows(type, b, row, up, NH, pk, NT, ff, r0, r1); }, bytes});
     }
+    {   // IQ4_XS gate/up: bit-exact multi-token kernel on AVX-512, multi-token kernel on AVX2
+        const size_t row = gu_row(23), up = row * NFF, bytes = 2 * up;
+        ops.push_back({"IQ4_XS gate/up", "avx512", bytes, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::iq_exact_512_gu_rows(23, b, row, up, NH, 1.f, 1.f, false, 0.f, pk, NT, ff, r0, r1); }, bytes});
+        ops.push_back({"IQ4_XS gate/up", "avx2", bytes, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::iq256_gu_rows(23, b, row, up, NH, pk, NT, ff, r0, r1); }, bytes});
+    }
     {   // Q4_K gate/up: AVX-512 CPUs run ggml's dot per token; AVX2 CPUs the multi-token kernel
         const size_t row = gu_row(12), up = row * NFF, bytes = 2 * up;
         auto tr = [&](const ggml_type_traits_cpu* t) {
@@ -173,11 +178,9 @@ int main(int argc, char** argv) {
         ops.push_back({"NVFP4 down", "avx512", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::nvfp4_512_down_rows(b, drow, NFF, 1.f, ph0, NT, out, r0, r1); }, dbytes});
         ops.push_back({"NVFP4 down", "avx2", dbytes, NH, trd(ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4)), dbytes});
     }
-    {   // IQ4_NL down: ggml's dot per token on AVX-512 CPUs, the multi-token kernel on AVX2 CPUs
+    {   // IQ4_NL down: 512-bit row-pair multi-token kernel on AVX-512, 256-bit multi-token kernel on AVX2
         const size_t drow = d_row(20), dbytes = drow * NH;
-        const auto* t = ggml_get_type_traits_cpu_avx512(GGML_TYPE_IQ4_NL);
-        ops.push_back({"IQ4_NL down", "avx512", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) {
-            for (int r = r0; r < r1; ++r) for (int k = 0; k < NT; ++k) t->vec_dot(NFF, &out[k][r], 0, b + r * drow, 0, ph0[k], 0, 1); }, dbytes});
+        ops.push_back({"IQ4_NL down", "avx512", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::iq4nl512_down_rows(b, drow, NFF, ph0, NT, out, r0, r1); }, dbytes});
         ops.push_back({"IQ4_NL down", "avx2", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::iq4nl256_down_rows(b, drow, NFF, ph0, NT, out, r0, r1); }, dbytes});
     }
     {   // Q2_0 down
@@ -224,7 +227,8 @@ int main(int argc, char** argv) {
         const std::string n = op.name;
         size_t blk = 0;
         if (n.rfind("IQ3_XXS", 0) == 0) type = 18; else if (n.rfind("IQ3_S", 0) == 0) type = 21; else if (n.rfind("IQ2_XXS", 0) == 0) type = 16;
-        else if (n.rfind("IQ2_XS", 0) == 0) type = 17; else if (n.rfind("IQ2_S", 0) == 0) type = 22; else if (n.rfind("Q4_K", 0) == 0) type = 12;
+        else if (n.rfind("IQ2_XS", 0) == 0) type = 17; else if (n.rfind("IQ2_S", 0) == 0) type = 22; else if (n.rfind("IQ4_XS", 0) == 0) type = 23;
+        else if (n.rfind("Q4_K", 0) == 0) type = 12;
         else if (n.rfind("NVFP4", 0) == 0) type = 40; else if (n.rfind("IQ4_NL", 0) == 0) type = 20; else if (n.rfind("Q2_0", 0) == 0) type = 42;
         blk = ggml_type_size((ggml_type) type);
         const size_t stride = (op.bytes + 63) & ~size_t(63);

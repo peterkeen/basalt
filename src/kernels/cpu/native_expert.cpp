@@ -47,13 +47,14 @@ void gu_rows_ggml(const NativeFmt& f, const uint8_t* blob, const void* const* ac
     }
 }
 
-// A layer whose gate and up types differ: each half through a multi-token row kernel (`rows`: iq512_rows or
-// iq256_rows), then native_gu_rows' SwiGLU expression.  A token's dots are the uniform layers' bits for each type.
+// A layer whose gate and up types differ: each half through a multi-token row kernel (`rows`), then native_gu_rows'
+// SwiGLU expression (with optional limit).  A token's dots are the uniform layers' bits for each type.
 template<typename Rows>
 void gu_rows_mixed(Rows rows, const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                    int r0, int r1) {
     constexpr int kTile = 64, kTok = 8;
     float ub[kTok][kTile];
+    const float lim = f.swiglu_limit;
     for (int t0 = 0; t0 < nt; t0 += kTok) {
         const int m = nt - t0 < kTok ? nt - t0 : kTok;
         for (int a = r0; a < r1; a += kTile) {
@@ -64,11 +65,20 @@ void gu_rows_mixed(Rows rows, const NativeFmt& f, const uint8_t* blob, const voi
             rows(f.up_type, blob + f.up_off + (size_t) a * f.up_row, f.up_row, (int) f.n_embd, act + t0, m, up, 0, b - a);
             for (int t = 0; t < m; ++t)
                 for (int r = a; r < b; ++r) {
-                    const float g = ff[t0 + t][r], u = ub[t][r - a];
+                    float g = ff[t0 + t][r], u = ub[t][r - a];
+                    if (lim > 0.f) {
+                        g = std::fmin(g, lim);
+                        u = std::fmax(std::fmin(u, lim), -lim);
+                    }
                     ff[t0 + t][r] = (g / (1.f + std::exp(-g))) * u;
                 }
         }
     }
+}
+
+bool iq512_mixed_ok(int type, float limit) {
+    if (limit <= 0.f && iq512_supported(type)) return true;
+    return type == GGML_TYPE_IQ1_S || iq_exact_512_supported(type);
 }
 
 }  // namespace
@@ -165,18 +175,25 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
                     int r0, int r1) {
     // The multi-token kernels decode the weights once for all tokens; the single-token ggml dot below serves the
     // formats without one.  A token's rows round the same alone as in a group, so greedy output does not depend on
-    // the number of drafts in a window.  A format with only an AVX-2 kernel (IQ4_XS) takes it on AVX-2 CPUs
-    // only: an AVX-512 CPU keeps the ggml dot for it.
+    // the number of drafts in a window.
     static const bool avx512 = cpu_avx512_ok();
     static const bool avx2 = cpu_avx2_ok();
     static const bool cpu512 = avx512;
+    const int n = (int) f.n_embd;
     if (f.up_type != f.gu_type) {   // gate and up of two types: each half on its type's row kernel
-        if (f.swiglu_limit <= 0.f && f.tail == 0) {
-            if (avx512 && iq512_supported(f.gu_type) && iq512_supported(f.up_type)) {
-                gu_rows_mixed(iq512_rows, f, blob, act, nt, ff, r0, r1);
+        if (f.tail == 0) {
+            if (avx512 && iq1s_512_fits(n) && iq512_mixed_ok(f.gu_type, f.swiglu_limit) &&
+                iq512_mixed_ok(f.up_type, f.swiglu_limit)) {
+                const float lim = f.swiglu_limit;
+                gu_rows_mixed([lim](int type, const uint8_t* w, size_t rb, int len, const void* const* a, int m,
+                                    float* const* o, int ra, int rb1) {
+                    if (lim <= 0.f && iq512_supported(type)) iq512_rows(type, w, rb, len, a, m, o, ra, rb1);
+                    else if (type == GGML_TYPE_IQ1_S) iq1s_512_rows(w, rb, len, a, m, o, ra, rb1);
+                    else iq_exact_512_rows(type, w, rb, len, a, m, o, ra, rb1);
+                }, f, blob, act, nt, ff, r0, r1);
                 return;
             }
-            if (!cpu512 && avx2 && iq256_supported(f.gu_type) && iq256_supported(f.up_type)) {
+            if (!cpu512 && avx2 && f.swiglu_limit <= 0.f && iq256_supported(f.gu_type) && iq256_supported(f.up_type)) {
                 gu_rows_mixed(iq256_rows, f, blob, act, nt, ff, r0, r1);
                 return;
             }
@@ -185,18 +202,18 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         else gu_rows_ggml<false>(f, blob, act, nt, ff, r0, r1, 1.f, 1.f);
         return;
     }
-    // the multi-token kernels have the plain SwiGLU built in: a limited layer takes the ggml dot below
+    // the 512-bit float accumulator kernels serve non-limited IQ2/IQ3 layers; limited layers and IQ4_XS / IQ1_M take
+    // the bit-exact multi-token AVX-512 kernels below
     if (f.swiglu_limit <= 0.f && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {
-            iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+            iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1);
             return;
         }
         if (avx2 && iq256_supported(f.gu_type)) {
-            iq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+            iq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1);
             return;
         }
     }
-    const int n = (int) f.n_embd;
     float sg = 1.f, su = 1.f;
     if (f.tail) {
         std::memcpy(&sg, blob + f.bytes - f.tail, 4);
@@ -207,7 +224,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         iq1s_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }
-    if (avx512 && f.swiglu_limit > 0.f && iq_exact_512_supported(f.gu_type) && iq1s_512_fits(n)) {
+    if (avx512 && iq_exact_512_supported(f.gu_type) && iq1s_512_fits(n)) {
         iq_exact_512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }
@@ -228,31 +245,42 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
-    // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles once per block instead of once per token;
-    // the ggml dot is single-token.
-    if (cpu_avx2_ok() && f.d_type == 20 && iq4nl256_fits((int) f.n_ff)) {   // the same rule as the gate/up rows
-        iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
-        return;
+    static const bool avx512 = cpu_avx512_ok();
+    static const bool avx2 = cpu_avx2_ok();
+    const int n = (int) f.n_ff;
+    if (f.d_type == 20 && !f.tail) {
+        if (avx512 && iq4nl512_fits(n)) {
+            iq4nl512_down_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
+            return;
+        }
+        if (avx2 && iq4nl256_fits(n)) {
+            iq4nl256_down_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
+            return;
+        }
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
-    const int n = (int) f.n_ff;
     float sd = 1.f;
     if (f.tail) std::memcpy(&sd, blob + f.bytes - f.tail + 8, 4);
-    static const bool avx512 = cpu_avx512_ok();
-    if (avx512 && f.d_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, (int) f.n_ff)) {
+    if (avx512 && f.d_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, n)) {
         nvfp4_512_down_rows(blob + f.down_off, f.d_row, n, sd, hq, nt, out, r0, r1);
         return;
     }
-    if (!avx512 && cpu_avx2_ok() && f.d_type == GGML_TYPE_NVFP4 && nvfp4_256_fits((int) f.n_embd, (int) f.n_ff)) {
+    if (!avx512 && avx2 && f.d_type == GGML_TYPE_NVFP4 && nvfp4_256_fits((int) f.n_embd, n)) {
         nvfp4_256_down_rows(blob + f.down_off, f.d_row, n, sd, hq, nt, out, r0, r1);
         return;
     }
-    if (avx512 && f.d_type == GGML_TYPE_IQ1_S && !f.tail && iq1s_512_fits(n)) {
-        iq1s_512_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
-        return;
+    if (avx512 && !f.tail && iq1s_512_fits(n)) {
+        if (f.d_type == GGML_TYPE_IQ1_S) {
+            iq1s_512_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
+            return;
+        }
+        if (iq_exact_512_supported(f.d_type)) {
+            iq_exact_512_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
+            return;
+        }
     }
-    if (avx512 && f.swiglu_limit > 0.f && !f.tail && iq_exact_512_supported(f.d_type) && iq1s_512_fits(n)) {
-        iq_exact_512_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
+    if (!avx512 && avx2 && f.swiglu_limit <= 0.f && !f.tail && iq256_supported(f.d_type)) {
+        iq256_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
         return;
     }
     for (int r = r0; r < r1; ++r) {

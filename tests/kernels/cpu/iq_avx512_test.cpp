@@ -17,6 +17,7 @@
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/iq_avx2.hpp"
 #include "basalt/kernels/cpu/iq_avx512.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 
@@ -170,6 +171,64 @@ int main(int argc, char** argv) {
         if (max_rel > 1e-3) { std::printf("REFERENCE ERROR too large for type %d (dot rows)\n", type); ++bad; }
         if (max_gu > 1e-4) { std::printf("REFERENCE ERROR too large for type %d (gate/up rows)\n", type); ++bad; }
     }
+
+    // IQ4_NL (type 20) 512-bit row-pair down kernel: bit for bit equal to iq4nl256_down_rows_vnni across token counts,
+    // extreme weight/activation patterns, and odd/even row-range splits.
+    {
+        cpu::NativeFmt f;
+        std::string err;
+        if (!cpu::native_fmt(23, 20, H, FF, f, err)) { std::printf("native_fmt(23, 20): %s\n", err.c_str()); return 1; }
+        size_t diff_vnni = 0, tok_diff = 0, split_diff = 0;
+        std::mt19937 rng(2020);
+        for (int mode = 0; mode < MODES; ++mode) {
+            std::vector<uint8_t> w(f.d_row * H);
+            fill(w, 20, 900 + (uint64_t) mode, mode);
+            std::vector<std::vector<uint8_t>> hq(MAXT, std::vector<uint8_t>(cpu::kNativeHBytes));
+            std::vector<float> h_in(FF);
+            for (int t = 0; t < MAXT; ++t) {
+                for (auto& v : h_in) v = mode == 2 ? ((rng() & 1) ? 1e3f : -1e3f) : (float) ((int) (rng() % 2001) - 1000) / 400.f;
+                cpu::native_quant_h(f, h_in.data(), hq[(size_t) t].data());
+            }
+            std::vector<std::vector<float>> one(MAXT, std::vector<float>(H));
+            for (int t = 0; t < MAXT; ++t) {
+                const void* p1[1] = {hq[(size_t) t].data()};
+                float* o1[1] = {one[(size_t) t].data()};
+                cpu::iq4nl512_down_rows(w.data(), f.d_row, FF, p1, 1, o1, 0, H);
+            }
+            for (int nt = 1; nt <= MAXT; ++nt) {
+                const void* hp[MAXT];
+                std::vector<std::vector<float>> got(nt, std::vector<float>(H)), ref(nt, std::vector<float>(H));
+                float *gp[MAXT], *rp[MAXT];
+                for (int t = 0; t < nt; ++t) {
+                    hp[t] = hq[(size_t) t].data();
+                    gp[t] = got[(size_t) t].data();
+                    rp[t] = ref[(size_t) t].data();
+                }
+                cpu::iq4nl512_down_rows(w.data(), f.d_row, FF, hp, nt, gp, 0, H);
+                cpu::iq4nl256_down_rows_vnni(w.data(), f.d_row, FF, hp, nt, rp, 0, H);
+                for (int t = 0; t < nt; ++t)
+                    for (int r = 0; r < H; ++r) {
+                        diff_vnni += std::memcmp(&gp[t][r], &rp[t][r], 4) != 0;
+                        tok_diff += std::memcmp(&gp[t][r], &one[(size_t) t][(size_t) r], 4) != 0;
+                    }
+                if (mode == 0 && (nt == 1 || nt == 4 || nt == 7)) {
+                    std::vector<std::vector<float>> sp(nt, std::vector<float>(H, -999.f));
+                    float* spp[MAXT];
+                    for (int t = 0; t < nt; ++t) spp[t] = sp[(size_t) t].data();
+                    const int cuts[] = {0, 1, 2, 9, 12, 23, 31, 40, H};
+                    for (size_t c = 0; c + 1 < sizeof(cuts) / sizeof(cuts[0]); ++c)
+                        cpu::iq4nl512_down_rows(w.data(), f.d_row, FF, hp, nt, spp, cuts[c], cuts[c + 1]);
+                    for (int t = 0; t < nt; ++t)
+                        for (int r = 0; r < H; ++r)
+                            split_diff += std::memcmp(&spp[t][r], &gp[t][r], 4) != 0;
+                }
+            }
+        }
+        std::printf("  type 20 (IQ4_NL down 512): vs vnni256 %zu diffs, token-count %zu diffs, row-split %zu diffs\n",
+                    diff_vnni, tok_diff, split_diff);
+        bad += diff_vnni != 0 || tok_diff != 0 || split_diff != 0;
+    }
+
     std::printf("iq_avx512_test: %s\n", bad ? "FAIL" : "PASS");
 
     if (bench) {   // 200 gate/up rows (the pool's task) per call, the weights cache-resident: one thread's decode rate

@@ -124,7 +124,8 @@ std::vector<double> ref_expert(const std::vector<float>& wg, const std::vector<f
 }
 
 const char* nm(int t) {
-    return t == 19 ? "IQ1_S" : t == 16 ? "IQ2_XXS" : t == 17 ? "IQ2_XS" : t == 22 ? "IQ2_S" : t == 29 ? "IQ1_M" : t == 40 ? "NVFP4" : "?";
+    return t == 19 ? "IQ1_S" : t == 16 ? "IQ2_XXS" : t == 17 ? "IQ2_XS" : t == 18 ? "IQ3_XXS" : t == 21 ? "IQ3_S" :
+           t == 22 ? "IQ2_S" : t == 23 ? "IQ4_XS" : t == 29 ? "IQ1_M" : t == 40 ? "NVFP4" : "?";
 }
 
 struct Expert {
@@ -610,7 +611,7 @@ void gpu_pair(int gu, int d, bool bench, cudaStream_t s) {
 void cpu_exact_dots() {
     if (!kc::cpu_avx512_ok()) return;
     constexpr int NT = 5;
-    for (int type : {19, 16, 17, 29}) {
+    for (int type : {19, 16, 17, 18, 21, 22, 23, 29}) {
         const ggml_type_traits_cpu* tr = ggml_get_type_traits_cpu((ggml_type) type);
         const size_t bs = ggml_type_size((ggml_type) type);
         const auto rows_of = [type](const uint8_t* w, size_t rb, int n, const void* const* a, int nt, float* const* o, int r0, int r1) {
@@ -701,7 +702,7 @@ void cpu_bench() {
     std::vector<float> o3b(rows), o3c(rows);
     float* op3[3] = {op, o3b.data(), o3c.data()};
     if (kc::cpu_avx512_ok()) run("avx512, 3 tokens", [&] { kc::iq1s_512_rows(w.data(), f.gu_row, H, ap3, 3, op3, 0, rows); });
-    for (int type : {16, 17, 29}) {
+    for (int type : {16, 17, 18, 21, 22, 23, 29}) {
         const size_t rb = (size_t) H / 256 * ggml_type_size((ggml_type) type);
         const int nr = (int) (131072000ull / rb);
         auto wt = random_rows(type, nr, H, 0.01f, rng);
@@ -746,6 +747,9 @@ int main(int argc, char** argv) {
     cpu_pair(17, 29, rng);
     cpu_pair(29, 16, rng);
     cpu_pair(17, 16, rng);
+    cpu_pair(23, 23, rng);
+    cpu_pair(21, 21, rng);
+    cpu_pair(18, 18, rng);
     cpu_pair(40, 40, rng);   // NVFP4 experts
 #ifdef BASALT_IQ1S_GPU
     if (!cpu_only) {

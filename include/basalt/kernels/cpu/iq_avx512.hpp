@@ -27,7 +27,8 @@ void iq1s_512_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, 
 void iq1s_512_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                    int r0, int r1);
 
-/// IQ2_XXS (16), IQ2_XS (17) and IQ1_M (29) rows, the same way: every token bit for bit ggml's single-token dot.
+/// IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23) and IQ1_M (29) rows, the same way:
+/// every token bit for bit ggml's single-token dot.
 bool iq_exact_512_supported(int ggml_type) noexcept;
 /// As iq1s_512_gu_rows, for a supported type.
 void iq_exact_512_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su,
@@ -35,5 +36,11 @@ void iq_exact_512_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, siz
 /// out[t][r] = w_r . a[t], for a supported type.
 void iq_exact_512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                        float* const* out, int r0, int r1);
+
+/// IQ4_NL (type 20) down rows against Q8_0 activations, two rows per 512-bit vector across multiple tokens; bit for bit
+/// equal to iq4nl256_down_rows_vnni.
+bool iq4nl512_fits(int n) noexcept;
+void iq4nl512_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
+                        int r0, int r1);
 
 }  // namespace basalt::kernels::cpu

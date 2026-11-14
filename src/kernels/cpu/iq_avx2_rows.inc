@@ -726,17 +726,20 @@ void BASALT_IQ_EXPORT(iq4nl256_down_rows)(const uint8_t* w, size_t row_bytes, in
                            iq4nl_max_blocks * QK4_NL, QK4_NL);
         std::exit(1);
     }
-    const block_q8_0* y[8];
+    if (nt > 4) {
+        for (int t0 = 0; t0 < nt; t0 += 4) {
+            const int k = nt - t0 < 4 ? nt - t0 : 4;
+            BASALT_IQ_EXPORT(iq4nl256_down_rows)(w, row_bytes, n, hq + t0, k, out + t0, r0, r1);
+        }
+        return;
+    }
+    const block_q8_0* y[4];
     for (int t = 0; t < nt; ++t) y[t] = (const block_q8_0*) hq[t];
     switch (nt) {
         case 1: iq4nl_rows<4, 1>(w, row_bytes, n, y, out, r0, r1); break;
         case 2: iq4nl_rows<2, 2>(w, row_bytes, n, y, out, r0, r1); break;
         case 3: iq4nl_rows<2, 3>(w, row_bytes, n, y, out, r0, r1); break;
-        case 4: iq4nl_rows<1, 4>(w, row_bytes, n, y, out, r0, r1); break;
-        default: for (int t0 = 0; t0 < nt; t0 += 4) {
-            const int k = nt - t0 < 4 ? nt - t0 : 4;
-            BASALT_IQ_EXPORT(iq4nl256_down_rows)(w, row_bytes, n, hq + t0, k, out + t0, r0, r1);
-        }
+        default: iq4nl_rows<1, 4>(w, row_bytes, n, y, out, r0, r1); break;
     }
 }
 
