@@ -6,6 +6,7 @@
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -292,7 +293,10 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         if (dm_ != nullptr && dm_->warm != nullptr && l + 1 < le_) {   // the next layer's warm-up
             CpuWarm& w = *dm_->warm;
             warm_pool_->idle_stop();
+            const auto& nf = basalt::kernels::cpu::expert_layout().fmt[(size_t) (l + 1)];
             w.layer = (int) (l + 1);
+            w.bytes = nf.bytes;
+            w.down_off = nf.down_off;
             w.n_tok = std::min(n, (int) kVerifyMaxT);
             w.xq = dm_->h_xq + (size_t) k * dm_->xq_stride;
             w.res0 = dm_->shadow0.data() + (size_t) (l + 1) * g.n_expert;
