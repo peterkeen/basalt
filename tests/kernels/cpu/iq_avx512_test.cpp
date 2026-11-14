@@ -19,6 +19,7 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/iq_avx2.hpp"
 #include "basalt/kernels/cpu/iq_avx512.hpp"
+#include "basalt/kernels/cpu/kq_avx512.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 
 #include <algorithm>
@@ -58,7 +59,15 @@ void fill(std::vector<uint8_t>& v, int type, uint64_t seed, int mode) {
     const size_t bs = ggml_type_size((ggml_type) type);
     for (size_t b = 0; b + bs <= v.size(); b += bs) {
         const uint16_t d = (uint16_t) (0x2800 + (rng() & 0xff));
-        std::memcpy(&v[b], &d, 2);
+        if (type == 14) {
+            std::memcpy(&v[b + bs - 2], &d, 2);
+        } else {
+            std::memcpy(&v[b], &d, 2);
+            if (type == 7 || type == 12 || type == 13) {
+                const uint16_t dm = (uint16_t) (0x2400 + (rng() & 0xff));
+                std::memcpy(&v[b + 2], &dm, 2);
+            }
+        }
     }
 }
 
@@ -227,6 +236,110 @@ int main(int argc, char** argv) {
         std::printf("  type 20 (IQ4_NL down 512): vs vnni256 %zu diffs, token-count %zu diffs, row-split %zu diffs\n",
                     diff_vnni, tok_diff, split_diff);
         bad += diff_vnni != 0 || tok_diff != 0 || split_diff != 0;
+    }
+
+    // K-quant and legacy AVX-512 VNNI kernels (Q4_K=12, Q5_K=13, Q6_K=14, Q5_1=7, Q8_0=8): bit for bit equal to
+    // ggml's single-token AVX-512 dot across 1..8 tokens, extreme byte patterns, SwiGLU limit/scales, mixed gate/up,
+    // and odd/even row-range splits.
+    {
+        for (int type : {12, 13, 14, 7, 8}) {
+            const bool is_k = (type == 12 || type == 13 || type == 14);
+            const int cols = is_k ? H : FF;
+            const int rows = is_k ? FF : H;
+            const size_t rb = ggml_row_size((ggml_type) type, cols);
+            const auto* tc = ggml_get_type_traits_cpu_avx512((ggml_type) type);
+            const ggml_type at = tc->vec_dot_type;
+            const auto* ta = ggml_get_type_traits_cpu_avx512(at);
+            size_t dot_diff = 0, gu_diff = 0, split_diff = 0;
+            std::mt19937 rng(3000 + type);
+            for (int mode = 0; mode < MODES; ++mode) {
+                std::vector<uint8_t> blob(2 * rb * (size_t) rows);
+                fill(blob, type, 1200 + (uint64_t) (type * 10 + mode), mode);
+                std::vector<std::vector<uint8_t>> act(MAXT, std::vector<uint8_t>(ggml_row_size(at, cols)));
+                std::vector<float> xin(cols);
+                const void* ap[MAXT];
+                for (int t = 0; t < MAXT; ++t) {
+                    for (auto& v : xin)
+                        v = mode == 2 ? ((rng() & 1) ? 1e3f : -1e3f) : (float) ((int) (rng() % 2001) - 1000) / 400.f;
+                    if (at == GGML_TYPE_Q8_K) cpu::quantize_q8_K_avx512(xin.data(), act[(size_t) t].data(), cols);
+                    else ta->from_float(xin.data(), act[(size_t) t].data(), cols);
+                    ap[t] = act[(size_t) t].data();
+                }
+                const float sg = 0.75f, su = 1.25f, sd = 0.5f, lim = 6.0f;
+                const bool sc_on = (mode == 2);
+                const float lim_on = (mode == 1) ? lim : 0.f;
+                std::vector<std::vector<float>> ref_d(MAXT, std::vector<float>(rows)), ref_gu(MAXT, std::vector<float>(rows));
+                for (int t = 0; t < MAXT; ++t)
+                    for (int r = 0; r < rows; ++r) {
+                        float g = 0.f, u = 0.f;
+                        tc->vec_dot(cols, &g, 0, blob.data() + (size_t) r * rb, 0, ap[t], 0, 1);
+                        tc->vec_dot(cols, &u, 0, blob.data() + (size_t) rows * rb + (size_t) r * rb, 0, ap[t], 0, 1);
+                        ref_d[(size_t) t][(size_t) r] = sc_on ? g * sd : g;
+                        if (sc_on) { g *= sg; u *= su; }
+                        if (lim_on > 0.f) { g = std::fmin(g, lim_on); u = std::fmax(std::fmin(u, lim_on), -lim_on); }
+                        ref_gu[(size_t) t][(size_t) r] = (g / (1.f + std::exp(-g))) * u;
+                    }
+                for (int nt = 1; nt <= MAXT; ++nt) {
+                    std::vector<std::vector<float>> gd(nt, std::vector<float>(rows)), ggu(nt, std::vector<float>(rows));
+                    float *p_d[MAXT], *p_gu[MAXT];
+                    for (int t = 0; t < nt; ++t) { p_d[t] = gd[(size_t) t].data(); p_gu[t] = ggu[(size_t) t].data(); }
+                    cpu::kq512_rows(type, blob.data(), rb, cols, sd, sc_on, ap, nt, p_d, 0, rows);
+                    cpu::kq512_gu_rows(type, blob.data(), rb, (size_t) rows * rb, cols, sg, su, sc_on, lim_on, ap, nt, p_gu, 0, rows);
+                    for (int t = 0; t < nt; ++t)
+                        for (int r = 0; r < rows; ++r) {
+                            dot_diff += std::memcmp(&p_d[t][r], &ref_d[(size_t) t][(size_t) r], 4) != 0;
+                            gu_diff += std::memcmp(&p_gu[t][r], &ref_gu[(size_t) t][(size_t) r], 4) != 0;
+                        }
+                    if (mode == 0 && (nt == 1 || nt == 4 || nt == 7)) {
+                        std::vector<std::vector<float>> sp(nt, std::vector<float>(rows, -999.f));
+                        float* spp[MAXT];
+                        for (int t = 0; t < nt; ++t) spp[t] = sp[(size_t) t].data();
+                        const int cuts[] = {0, 1, 3, 10, 19, 32, rows};
+                        for (size_t c = 0; c + 1 < sizeof(cuts) / sizeof(cuts[0]); ++c)
+                            cpu::kq512_rows(type, blob.data(), rb, cols, sd, sc_on, ap, nt, spp, cuts[c], cuts[c + 1]);
+                        for (int t = 0; t < nt; ++t)
+                            for (int r = 0; r < rows; ++r)
+                                split_diff += std::memcmp(&spp[t][r], &p_d[t][r], 4) != 0;
+                    }
+                }
+            }
+            std::printf("  type %2d (kq512 %-5s): vs ggml dot %zu diffs, gu %zu diffs, row-split %zu diffs\n",
+                        type, ggml_type_name((ggml_type) type), dot_diff, gu_diff, split_diff);
+            bad += dot_diff != 0 || gu_diff != 0 || split_diff != 0;
+        }
+        // Mixed gate/up (Q4_K gate + Q5_K up) through native_gu_rows
+        cpu::NativeFmt fm;
+        std::string ferr;
+        if (!cpu::native_fmt(12, 7, H, FF, fm, ferr, 6.0f, 13)) {
+            std::printf("native_fmt(12/13, 7): %s\n", ferr.c_str());
+            ++bad;
+        } else {
+            std::vector<uint8_t> blob(fm.bytes);
+            fill(blob, 12, 4100, 0);
+            std::vector<uint8_t> upb(fm.down_off - fm.up_off);
+            fill(upb, 13, 4101, 0);
+            std::memcpy(blob.data() + fm.up_off, upb.data(), upb.size());
+            std::mt19937 rng(42);
+            std::vector<std::vector<uint8_t>> act(4, std::vector<uint8_t>(cpu::kNativeActBytes));
+            std::vector<float> xin(H);
+            const void* ap[4];
+            for (int t = 0; t < 4; ++t) {
+                for (auto& v : xin) v = (float) ((int) (rng() % 2001) - 1000) / 400.f;
+                cpu::native_quant_act(fm, xin.data(), act[(size_t) t].data());
+                ap[t] = act[(size_t) t].data();
+            }
+            std::vector<std::vector<float>> f4(4, std::vector<float>(FF)), f1(4, std::vector<float>(FF));
+            float* pf4[4] = {f4[0].data(), f4[1].data(), f4[2].data(), f4[3].data()};
+            cpu::native_gu_rows(fm, blob.data(), ap, 4, pf4, 0, FF);
+            size_t mix_diff = 0;
+            for (int t = 0; t < 4; ++t) {
+                const void* a1[1] = {ap[t]};
+                float* p1[1] = {f1[(size_t) t].data()};
+                cpu::native_gu_rows(fm, blob.data(), a1, 1, p1, 0, FF);
+                for (int r = 0; r < FF; ++r) mix_diff += std::memcmp(&f4[(size_t) t][(size_t) r], &f1[(size_t) t][(size_t) r], 4) != 0;
+            }
+            bad += mix_diff != 0;
+        }
     }
 
     std::printf("iq_avx512_test: %s\n", bad ? "FAIL" : "PASS");

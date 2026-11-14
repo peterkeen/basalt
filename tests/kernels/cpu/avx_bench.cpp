@@ -13,6 +13,7 @@
 #include "basalt/kernels/cpu/iq_avx2.hpp"
 #include "basalt/kernels/cpu/iq_avx512.hpp"
 #include "basalt/kernels/cpu/kq_avx2.hpp"
+#include "basalt/kernels/cpu/kq_avx512.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
@@ -53,7 +54,14 @@ void fill(std::vector<uint8_t>& v, int type, size_t blk, uint64_t seed) {
     for (size_t i = 0; i + 8 <= v.size(); i += 8) { uint64_t r = rng(); std::memcpy(v.data() + i, &r, 8); }
     for (size_t b = 0; b + blk <= v.size(); b += blk) {
         if (type == 40) { for (int k = 0; k < 4; ++k) v[b + k] = 0x30 + (v[b + k] & 7); }
-        else { const uint16_t d = 0x2800 + (v[b] & 0xff); std::memcpy(&v[b], &d, 2); if (type == 12) { const uint16_t dm = 0x2400 + (v[b + 3] & 0xff); std::memcpy(&v[b + 2], &dm, 2); } }
+        else {
+            const uint16_t d = 0x2800 + (v[b] & 0xff);
+            if (type == 14) std::memcpy(&v[b + blk - 2], &d, 2);
+            else {
+                std::memcpy(&v[b], &d, 2);
+                if (type == 7 || type == 12 || type == 13) { const uint16_t dm = 0x2400 + (v[b + 3] & 0xff); std::memcpy(&v[b + 2], &dm, 2); }
+            }
+        }
     }
 }
 
@@ -98,6 +106,7 @@ double run_1t(const Op& op, uint8_t* blob, int reps) {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc > 1) NT = std::atoi(argv[1]);
+    if (NT < 1 || NT > 8) { std::fprintf(stderr, "usage: avx_bench [tokens 1..8] [threads] [experts] [reps]\n"); return 2; }
     const int threads = argc > 2 ? std::atoi(argv[2]) : 14;
     const int E = argc > 3 ? std::atoi(argv[3]) : 96;
     const int reps = argc > 4 ? std::atoi(argv[4]) : 3;
@@ -109,10 +118,11 @@ int main(int argc, char** argv) {
     std::normal_distribution<float> nd(0.f, 1.f);
     const auto* tq8k = ggml_get_type_traits_cpu_avx2(GGML_TYPE_Q8_K);
     const auto* tq80 = ggml_get_type_traits_cpu_avx2(GGML_TYPE_Q8_0);
+    const auto* tq81 = ggml_get_type_traits_cpu_avx2(GGML_TYPE_Q8_1);
     std::vector<std::vector<float>> xs(NT, std::vector<float>(NH)), hs(NT, std::vector<float>(NFF));
-    std::vector<std::vector<uint8_t>> a_k(NT), a_0(NT), h_0(NT);
+    std::vector<std::vector<uint8_t>> a_k(NT), a_0(NT), h_0(NT), h_81(NT);
     std::vector<cpu::ActQ> a_1(NT), h_1(NT);
-    const void *pk[8], *p0[8], *ph0[8];
+    const void *pk[8], *p0[8], *ph0[8], *ph81[8];
     const cpu::ActQ* ph1[8];
     for (int t = 0; t < NT; ++t) {
         for (auto& v : xs[t]) v = nd(rng);
@@ -120,12 +130,14 @@ int main(int argc, char** argv) {
         a_k[t].resize(ggml_row_size(GGML_TYPE_Q8_K, NH));
         a_0[t].resize(ggml_row_size(GGML_TYPE_Q8_0, NH));
         h_0[t].resize(ggml_row_size(GGML_TYPE_Q8_0, NFF));
+        h_81[t].resize(ggml_row_size(GGML_TYPE_Q8_1, NFF));
         tq8k->from_float(xs[t].data(), a_k[t].data(), NH);
         tq80->from_float(xs[t].data(), a_0[t].data(), NH);
         tq80->from_float(hs[t].data(), h_0[t].data(), NFF);
+        tq81->from_float(hs[t].data(), h_81[t].data(), NFF);
         cpu::act_quant_q8_1_avx2(xs[t].data(), NH, a_1[t]);
         cpu::act_quant_q8_1_avx2(hs[t].data(), NFF, h_1[t]);
-        pk[t] = a_k[t].data(); p0[t] = a_0[t].data(); ph0[t] = h_0[t].data(); ph1[t] = &h_1[t];
+        pk[t] = a_k[t].data(); p0[t] = a_0[t].data(); ph0[t] = h_0[t].data(); ph81[t] = h_81[t].data(); ph1[t] = &h_1[t];
     }
     std::vector<std::vector<float>> ffv(NT, std::vector<float>(NFF)), outv(NT, std::vector<float>(NH));
     // per-thread outputs: each thread writes its own rows, so sharing the arrays is safe
@@ -148,14 +160,22 @@ int main(int argc, char** argv) {
         ops.push_back({"IQ4_XS gate/up", "avx512", bytes, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::iq_exact_512_gu_rows(23, b, row, up, NH, 1.f, 1.f, false, 0.f, pk, NT, ff, r0, r1); }, bytes});
         ops.push_back({"IQ4_XS gate/up", "avx2", bytes, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::iq256_gu_rows(23, b, row, up, NH, pk, NT, ff, r0, r1); }, bytes});
     }
-    {   // Q4_K gate/up: AVX-512 CPUs run ggml's dot per token; AVX2 CPUs the multi-token kernel
-        const size_t row = gu_row(12), up = row * NFF, bytes = 2 * up;
-        auto tr = [&](const ggml_type_traits_cpu* t) {
+    {   // Q4_K and Q5_K gate/up: multi-token AVX-512 VNNI vs AVX2 ggml single-token and AVX2 multi-token
+        const size_t row4 = gu_row(12), up4 = row4 * NFF, bytes4 = 2 * up4;
+        auto tr4 = [&](const ggml_type_traits_cpu* t) {
             return [=](const uint8_t* b, int r0, int r1, int) {
-                for (int r = r0; r < r1; ++r) for (int k = 0; k < NT; ++k) { float g, u; t->vec_dot(NH, &g, 0, b + r * row, 0, pk[k], 0, 1); t->vec_dot(NH, &u, 0, b + up + r * row, 0, pk[k], 0, 1); ff[k][r] = g * u; } };
+                for (int r = r0; r < r1; ++r) for (int k = 0; k < NT; ++k) { float g, u; t->vec_dot(NH, &g, 0, b + r * row4, 0, pk[k], 0, 1); t->vec_dot(NH, &u, 0, b + up4 + r * row4, 0, pk[k], 0, 1); ff[k][r] = (g / (1.f + std::exp(-g))) * u; } };
         };
-        ops.push_back({"Q4_K gate/up", "avx512", bytes, NFF, tr(ggml_get_type_traits_cpu_avx512(GGML_TYPE_Q4_K)), bytes});
-        ops.push_back({"Q4_K gate/up", "avx2", bytes, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::kq256_gu_rows(12, b, row, up, NH, pk, NT, ff, r0, r1); }, bytes});
+        ops.push_back({"Q4_K gate/up", "avx512", bytes4, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::kq512_gu_rows(12, b, row4, up4, NH, 1.f, 1.f, false, 0.f, pk, NT, ff, r0, r1); }, bytes4});
+        ops.push_back({"Q4_K gate/up", "avx2", bytes4, NFF, tr4(ggml_get_type_traits_cpu_avx2(GGML_TYPE_Q4_K)), bytes4});
+        ops.push_back({"Q4_K gate/up", "avx2 mt", bytes4, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::kq256_gu_rows(12, b, row4, up4, NH, pk, NT, ff, r0, r1); }, bytes4});
+        const size_t row5 = gu_row(13), up5 = row5 * NFF, bytes5 = 2 * up5;
+        auto tr5 = [&](const ggml_type_traits_cpu* t) {
+            return [=](const uint8_t* b, int r0, int r1, int) {
+                for (int r = r0; r < r1; ++r) for (int k = 0; k < NT; ++k) { float g, u; t->vec_dot(NH, &g, 0, b + r * row5, 0, pk[k], 0, 1); t->vec_dot(NH, &u, 0, b + up5 + r * row5, 0, pk[k], 0, 1); ff[k][r] = (g / (1.f + std::exp(-g))) * u; } };
+        };
+        ops.push_back({"Q5_K gate/up", "avx512", bytes5, NFF, [=](const uint8_t* b, int r0, int r1, int) { cpu::kq512_gu_rows(13, b, row5, up5, NH, 1.f, 1.f, false, 0.f, pk, NT, ff, r0, r1); }, bytes5});
+        ops.push_back({"Q5_K gate/up", "avx2", bytes5, NFF, tr5(ggml_get_type_traits_cpu_avx2(GGML_TYPE_Q5_K)), bytes5});
     }
     {   // NVFP4 gate/up and down
         const size_t row = gu_row(40), up = row * NFF, bytes = 2 * up, drow = d_row(40), dbytes = drow * NH;
@@ -177,6 +197,18 @@ int main(int argc, char** argv) {
             ops.push_back({"NVFP4 down", "vnni8 mt", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::nvfp4_256_down_rows_vnni(b, drow, NFF, 1.f, ph0, NT, out, r0, r1); }, dbytes});
         ops.push_back({"NVFP4 down", "avx512", dbytes, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::nvfp4_512_down_rows(b, drow, NFF, 1.f, ph0, NT, out, r0, r1); }, dbytes});
         ops.push_back({"NVFP4 down", "avx2", dbytes, NH, trd(ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4)), dbytes});
+    }
+    {   // Q5_1 and Q8_0 down: 512-bit row-pair VNNI on AVX-512 vs AVX2 ggml single-token and AVX2 multi-token
+        const size_t drow5 = d_row(7), dbytes5 = drow5 * NH;
+        const auto* t51 = ggml_get_type_traits_cpu_avx2(GGML_TYPE_Q5_1);
+        ops.push_back({"Q5_1 down", "avx512", dbytes5, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::kq512_rows(7, b, drow5, NFF, 1.f, false, ph81, NT, out, r0, r1); }, dbytes5});
+        ops.push_back({"Q5_1 down", "avx2", dbytes5, NH, [=](const uint8_t* b, int r0, int r1, int) { for (int r = r0; r < r1; ++r) for (int k = 0; k < NT; ++k) t51->vec_dot(NFF, &out[k][r], 0, b + r * drow5, 0, ph81[k], 0, 1); }, dbytes5});
+        ops.push_back({"Q5_1 down", "avx2 mt", dbytes5, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::kq256_rows(7, b, drow5, NFF, ph81, NT, out, r0, r1); }, dbytes5});
+        const size_t drow8 = d_row(8), dbytes8 = drow8 * NH;
+        const auto* t80 = ggml_get_type_traits_cpu_avx2(GGML_TYPE_Q8_0);
+        ops.push_back({"Q8_0 down", "avx512", dbytes8, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::kq512_rows(8, b, drow8, NFF, 1.f, false, ph0, NT, out, r0, r1); }, dbytes8});
+        ops.push_back({"Q8_0 down", "avx2", dbytes8, NH, [=](const uint8_t* b, int r0, int r1, int) { for (int r = r0; r < r1; ++r) for (int k = 0; k < NT; ++k) t80->vec_dot(NFF, &out[k][r], 0, b + r * drow8, 0, ph0[k], 0, 1); }, dbytes8});
+        ops.push_back({"Q8_0 down", "avx2 mt", dbytes8, NH, [=](const uint8_t* b, int r0, int r1, int) { cpu::kq256_rows(8, b, drow8, NFF, ph0, NT, out, r0, r1); }, dbytes8});
     }
     {   // IQ4_NL down: 512-bit row-pair multi-token kernel on AVX-512, 256-bit multi-token kernel on AVX2
         const size_t drow = d_row(20), dbytes = drow * NH;
@@ -228,7 +260,8 @@ int main(int argc, char** argv) {
         size_t blk = 0;
         if (n.rfind("IQ3_XXS", 0) == 0) type = 18; else if (n.rfind("IQ3_S", 0) == 0) type = 21; else if (n.rfind("IQ2_XXS", 0) == 0) type = 16;
         else if (n.rfind("IQ2_XS", 0) == 0) type = 17; else if (n.rfind("IQ2_S", 0) == 0) type = 22; else if (n.rfind("IQ4_XS", 0) == 0) type = 23;
-        else if (n.rfind("Q4_K", 0) == 0) type = 12;
+        else if (n.rfind("Q4_K", 0) == 0) type = 12; else if (n.rfind("Q5_K", 0) == 0) type = 13;
+        else if (n.rfind("Q5_1", 0) == 0) type = 7; else if (n.rfind("Q8_0", 0) == 0) type = 8;
         else if (n.rfind("NVFP4", 0) == 0) type = 40; else if (n.rfind("IQ4_NL", 0) == 0) type = 20; else if (n.rfind("Q2_0", 0) == 0) type = 42;
         blk = ggml_type_size((ggml_type) type);
         const size_t stride = (op.bytes + 63) & ~size_t(63);

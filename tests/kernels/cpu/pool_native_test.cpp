@@ -67,7 +67,15 @@ void fill_blob(uint8_t* p, const cpu::NativeFmt& f, uint64_t seed) {
         const size_t bs = ggml_type_size((ggml_type) type);
         for (size_t b = 0; b + bs <= len; b += bs) {
             const uint16_t d = (uint16_t) (0x2800 + (p[off + b] & 0xff));
-            std::memcpy(p + off + b, &d, 2);
+            if (type == 14) {
+                std::memcpy(p + off + b + bs - 2, &d, 2);
+            } else {
+                std::memcpy(p + off + b, &d, 2);
+                if (type == 7 || type == 12 || type == 13) {
+                    const uint16_t dm = (uint16_t) (0x2400 + (p[off + b + 2] & 0xff));
+                    std::memcpy(p + off + b + 2, &dm, 2);
+                }
+            }
         }
     };
     scales(0, 2 * f.up_off, f.gu_type);
@@ -128,7 +136,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     std::vector<Format> formats;
-    for (auto g : {std::pair<int, int>{22, 20}, {18, 20}, {21, 20}, {23, 20}, {22, 42}, {21, 42}, {42, 20}, {42, 42}, {40, 40}}) {
+    for (auto g : {std::pair<int, int>{22, 20}, {18, 20}, {21, 20}, {23, 20}, {22, 42}, {21, 42}, {42, 20}, {42, 42}, {40, 40}, {12, 7}, {13, 8}}) {
         Format fm;
         fm.gu = g.first;
         fm.d = g.second;

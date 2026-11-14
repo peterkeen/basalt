@@ -5,6 +5,7 @@
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/iq_avx512.hpp"
 #include "basalt/kernels/cpu/iq_avx2.hpp"
+#include "basalt/kernels/cpu/kq_avx512.hpp"
 #include "basalt/kernels/cpu/kq_avx2.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
@@ -76,9 +77,15 @@ void gu_rows_mixed(Rows rows, const NativeFmt& f, const uint8_t* blob, const voi
     }
 }
 
-bool iq512_mixed_ok(int type, float limit) {
+bool mixed_512_ok(int type, int n, float limit) {
+    if (kq512_supported(type)) return kq512_fits(type, n);
+    if (!iq1s_512_fits(n)) return false;
     if (limit <= 0.f && iq512_supported(type)) return true;
     return type == GGML_TYPE_IQ1_S || iq_exact_512_supported(type);
+}
+
+bool mixed_256_ok(int type, int nt) {
+    return iq256_supported(type) || (nt > 1 && kq256_supported(type));
 }
 
 }  // namespace
@@ -182,19 +189,24 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     const int n = (int) f.n_embd;
     if (f.up_type != f.gu_type) {   // gate and up of two types: each half on its type's row kernel
         if (f.tail == 0) {
-            if (avx512 && iq1s_512_fits(n) && iq512_mixed_ok(f.gu_type, f.swiglu_limit) &&
-                iq512_mixed_ok(f.up_type, f.swiglu_limit)) {
+            if (avx512 && mixed_512_ok(f.gu_type, n, f.swiglu_limit) &&
+                mixed_512_ok(f.up_type, n, f.swiglu_limit)) {
                 const float lim = f.swiglu_limit;
                 gu_rows_mixed([lim](int type, const uint8_t* w, size_t rb, int len, const void* const* a, int m,
                                     float* const* o, int ra, int rb1) {
-                    if (lim <= 0.f && iq512_supported(type)) iq512_rows(type, w, rb, len, a, m, o, ra, rb1);
+                    if (kq512_supported(type)) kq512_rows(type, w, rb, len, 1.f, false, a, m, o, ra, rb1);
+                    else if (lim <= 0.f && iq512_supported(type)) iq512_rows(type, w, rb, len, a, m, o, ra, rb1);
                     else if (type == GGML_TYPE_IQ1_S) iq1s_512_rows(w, rb, len, a, m, o, ra, rb1);
                     else iq_exact_512_rows(type, w, rb, len, a, m, o, ra, rb1);
                 }, f, blob, act, nt, ff, r0, r1);
                 return;
             }
-            if (!cpu512 && avx2 && f.swiglu_limit <= 0.f && iq256_supported(f.gu_type) && iq256_supported(f.up_type)) {
-                gu_rows_mixed(iq256_rows, f, blob, act, nt, ff, r0, r1);
+            if (!cpu512 && avx2 && f.swiglu_limit <= 0.f && mixed_256_ok(f.gu_type, nt) && mixed_256_ok(f.up_type, nt)) {
+                gu_rows_mixed([](int type, const uint8_t* w, size_t rb, int len, const void* const* a, int m,
+                                 float* const* o, int ra, int rb1) {
+                    if (iq256_supported(type)) iq256_rows(type, w, rb, len, a, m, o, ra, rb1);
+                    else kq256_rows(type, w, rb, len, a, m, o, ra, rb1);
+                }, f, blob, act, nt, ff, r0, r1);
                 return;
             }
         }
@@ -218,6 +230,14 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     if (f.tail) {
         std::memcpy(&sg, blob + f.bytes - f.tail, 4);
         std::memcpy(&su, blob + f.bytes - f.tail + 4, 4);
+    }
+    if (avx512 && kq512_supported(f.gu_type) && kq512_fits(f.gu_type, n)) {
+        kq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
+        return;
+    }
+    if (!avx512 && avx2 && nt > 1 && f.swiglu_limit <= 0.f && !f.tail && kq256_supported(f.gu_type)) {
+        kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1);
+        return;
     }
     // IQ1_S on AVX-512: bitwise equal per token to the ggml dot, the SwiGLU limit included.
     if (avx512 && f.gu_type == GGML_TYPE_IQ1_S && iq1s_512_fits(n)) {
@@ -261,6 +281,14 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     float sd = 1.f;
     if (f.tail) std::memcpy(&sd, blob + f.bytes - f.tail + 8, 4);
+    if (avx512 && kq512_supported(f.d_type) && kq512_fits(f.d_type, n)) {
+        kq512_rows(f.d_type, blob + f.down_off, f.d_row, n, sd, f.tail != 0, hq, nt, out, r0, r1);
+        return;
+    }
+    if (!avx512 && avx2 && nt > 1 && !f.tail && kq256_supported(f.d_type)) {
+        kq256_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
+        return;
+    }
     if (avx512 && f.d_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, n)) {
         nvfp4_512_down_rows(blob + f.down_off, f.d_row, n, sd, hq, nt, out, r0, r1);
         return;
