@@ -2,14 +2,20 @@
 //
 // See include/basalt/kernels/cpu/expert.hpp first; it says why each piece is shaped this way.
 #include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/log.hpp"
 
 #include <immintrin.h>
 
+#include <cstdlib>
 #include <cstring>
 
 namespace basalt::kernels::cpu {
 
 void act_quant_q8_1(const float* x, int n, ActQ& a) {
+    if (n < 0 || n % QKA != 0 || n > kActMaxWidth) {
+        basalt::log::error("basalt", "act_quant_q8_1: width %d; at most %d, in chunks of %d", n, kActMaxWidth, QKA);
+        std::abort();
+    }
     a.nchunks = n / QKA;
     // Round half away from zero (`t + copysign(0.5, t)`, truncated), matching `lround` without a per-element call or
     // `_mm512_roundscale_ps`'s half-to-even ties.
@@ -97,6 +103,10 @@ void q2g_rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const
 
 void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                           float* const* out, int r0, int r1) {
+    if (nblocks < 0 || nblocks > MAXC / 2) {
+        basalt::log::error("basalt", "q2_0_gguf_rows_multi: %d blocks; at most %d", nblocks, MAXC / 2);
+        std::abort();
+    }
     switch (nt) {
         case 1: q2g_rows<1>(w, row_bytes, nblocks, a, out, r0, r1); break;
         case 2: q2g_rows<2>(w, row_bytes, nblocks, a, out, r0, r1); break;
@@ -105,7 +115,12 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
         case 5: q2g_rows<5>(w, row_bytes, nblocks, a, out, r0, r1); break;
         case 6: q2g_rows<6>(w, row_bytes, nblocks, a, out, r0, r1); break;
         case 7: q2g_rows<7>(w, row_bytes, nblocks, a, out, r0, r1); break;
-        default: q2g_rows<8>(w, row_bytes, nblocks, a, out, r0, r1); break;
+        case 8: q2g_rows<8>(w, row_bytes, nblocks, a, out, r0, r1); break;
+        default:
+            for (int t0 = 0; t0 < nt; t0 += 8) {
+                const int k = nt - t0 < 8 ? nt - t0 : 8;
+                q2_0_gguf_rows_multi(w, row_bytes, nblocks, a + t0, k, out + t0, r0, r1);
+            }
     }
 }
 

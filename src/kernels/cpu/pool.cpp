@@ -322,8 +322,14 @@ void ExpertPool::native_gu_range(int e, int r0, int r1) {
         q2_rows_any(j.blob, nfmt_->gu_row, nbk, j.act, j.nt, gp, r0, r1);
         q2_rows_any(j.blob + nfmt_->up_off, nfmt_->gu_row, nbk, j.act, j.nt, up, r0, r1);
         for (int t = 0; t < j.nt; ++t)
-            for (int r = r0; r < r1; ++r)
-                sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+            for (int r = r0; r < r1; ++r) {
+                float g = gbuf[t][r], u = ubuf[t][r];
+                if (nfmt_->swiglu_limit > 0.f) {
+                    g = std::fmin(g, nfmt_->swiglu_limit);
+                    u = std::fmax(std::fmin(u, nfmt_->swiglu_limit), -nfmt_->swiglu_limit);
+                }
+                sb.ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            }
         return;
     }
     float* ff[MAXT];

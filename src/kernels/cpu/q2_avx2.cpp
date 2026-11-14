@@ -6,10 +6,12 @@
 // run time.  The quantizer is the scalar rule, bit for bit.
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/log.hpp"
 
 #include <immintrin.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #define BASALT_Q2_VNNI 0
@@ -26,6 +28,10 @@ void q2_0_gguf_rows_multi_avx2(const uint8_t* w, size_t row_bytes, int nblocks, 
 }
 
 void act_quant_q8_1_avx2(const float* x, int n, ActQ& a) {
+    if (n < 0 || n % QKA != 0 || n > kActMaxWidth) {
+        basalt::log::error("basalt", "act_quant_q8_1_avx2: width %d; at most %d, in chunks of %d", n, kActMaxWidth, QKA);
+        std::abort();
+    }
     a.nchunks = n / QKA;
     const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
     const __m256 half = _mm256_set1_ps(0.5f), mhalf = _mm256_set1_ps(-0.5f), zero = _mm256_setzero_ps();

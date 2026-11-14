@@ -82,6 +82,10 @@ void rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a,
 
 void BASALT_Q2_EXPORT(q2_0_gguf_rows_multi_avx2)(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a,
                                                  int nt, float* const* out, int r0, int r1) {
+    if (nblocks < 0 || nblocks > MAXC / 2) {
+        basalt::log::error("basalt", "q2_0_gguf_rows_multi_avx2: %d blocks; at most %d", nblocks, MAXC / 2);
+        std::abort();
+    }
     switch (nt) {
         case 1: rows<1>(w, row_bytes, nblocks, a, out, r0, r1); break;
         case 2: rows<2>(w, row_bytes, nblocks, a, out, r0, r1); break;

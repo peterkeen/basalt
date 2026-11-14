@@ -501,7 +501,7 @@ int main(int argc, char** argv) {
                 float *pb[MAXT], *pv[MAXT];
                 for (int t = 0; t < nt; ++t) { pb[t] = ob[(size_t) t].data(); pv[t] = ov[(size_t) t].data(); }
                 cpu::q2_0_gguf_rows_multi_avx2_base(blob.data(), ROW, NB, ap, nt, pb, 0, H);
-                if (avx512) {   // the AVX-512 rows give the same bits
+                if (avx512) {   // AVX-512 reduces 16 float lanes vs AVX2's 8: check FP32 closeness and bitwise invariance
                     std::vector<std::vector<float>> oa(nt, std::vector<float>(H));
                     float* pa[MAXT];
                     for (int t = 0; t < nt; ++t) pa[t] = oa[(size_t) t].data();
@@ -510,6 +510,31 @@ int main(int argc, char** argv) {
                         ++compared;
                         if (std::memcmp(pa[t], pb[t], H * 4)) ++q2_512_diff;
                         for (int r = 0; r < H; ++r) st512.add(pa[t][r], pb[t][r]);
+                    }
+                    std::vector<float> one(H, 0.f);
+                    for (int t = 0; t < nt; ++t) {
+                        float* op[1] = {one.data()};
+                        cpu::q2_0_gguf_rows_multi(blob.data(), ROW, NB, ap + t, 1, op, 0, H);
+                        ++compared;
+                        if (std::memcmp(op[0], pa[t], H * 4)) {
+                            std::printf("MISMATCH Q2_0 down avx512 token %d alone vs nt %d\n", t, nt);
+                            ++bad;
+                        }
+                    }
+                    std::vector<std::vector<float>> part(nt, std::vector<float>(H, 0.f));
+                    float* pp[MAXT];
+                    for (int t = 0; t < nt; ++t) pp[t] = part[(size_t) t].data();
+                    for (int r = 0; r < H;) {
+                        const int r1 = std::min(H, r + 1 + (r * 7 + nt) % 13);
+                        cpu::q2_0_gguf_rows_multi(blob.data(), ROW, NB, ap, nt, pp, r, r1);
+                        r = r1;
+                    }
+                    for (int t = 0; t < nt; ++t) {
+                        ++compared;
+                        if (std::memcmp(pp[t], pa[t], H * 4)) {
+                            std::printf("MISMATCH Q2_0 down avx512 row ranges nt %d token %d\n", nt, t);
+                            ++bad;
+                        }
                     }
                 }
                 if (vnni) {

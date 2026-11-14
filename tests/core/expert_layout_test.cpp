@@ -111,6 +111,10 @@ void refusals() {
           "a missing layer is refused");
     check(!load(layout(5, blob + 8, ""), 2, 512, err), "a blob size that does not match the formats is refused");
     check(!load("# experts v5: x\n0 12 seven 0 1\n", 1, 512, err), "a malformed line is refused");
+    check(!basalt::kernels::cpu::native_fmt(42, 42, 5120, 640, f, err) &&
+              !basalt::kernels::cpu::native_fmt(12, 8, 2560, 2560, f, err) &&
+              basalt::kernels::cpu::native_fmt(22, 42, 5120, 2048, f, err),
+          "Q2_0 gate/up past kActMaxWidth and n_ff past kNativeMaxFF are refused; Q2_0 down at 2048 fits");
 }
 
 // ---- 3. v7: gate and up of their own types
