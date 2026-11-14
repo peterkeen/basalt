@@ -264,41 +264,41 @@ namespace {
 // the block stride of the GGUF layout: the same unpack, the same VNNI dot, the same correction.
 namespace {
 template<int NT>
-inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nblocks, float* res) {
-    __m512 acc[NT], corr[NT];
-    for (int t = 0; t < NT; ++t) { acc[t] = _mm512_setzero_ps(); corr[t] = _mm512_setzero_ps(); }
-    const __m512i base = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
-    const __m512i dup = _mm512_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7);
-    for (int b0 = 0; b0 < nblocks; b0 += 8) {
-        const int nb = nblocks - b0 < 8 ? nblocks - b0 : 8;
-        const __mmask16 m16 = nb >= 8 ? (__mmask16) 0xFFFF : (__mmask16) ((1u << (2 * nb)) - 1u);
-        alignas(16) uint16_t sc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        for (int i = 0; i < nb; ++i) std::memcpy(&sc[i], row + (size_t) (b0 + i) * 18, 2);
-        const __m512 d8 = _mm512_castps256_ps512(_mm256_cvtph_ps(_mm_load_si128((const __m128i*) sc)));
-        const __m512 dd = _mm512_maskz_mov_ps(m16, _mm512_permutexvar_ps(dup, d8));
-        __m512 p[NT];
+inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, const __m512* as, const float* hxs, int nblocks,
+                          float* res) {
+    __m512 acc[NT];
+    float corr[NT];
+    for (int t = 0; t < NT; ++t) { acc[t] = _mm512_setzero_ps(); corr[t] = 0.f; }
+    for (int b = 0; b < nblocks; ++b) {
+        const uint8_t* blk = row + (size_t) b * 18;
+        uint16_t dh;
+        std::memcpy(&dh, blk, 2);
+        const float d = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) dh)));
+        const __m512 dv = _mm512_set1_ps(d);
+        const __m512i w = unpack64_q2_0(blk + 2);
         for (int t = 0; t < NT; ++t) {
-            p[t] = _mm512_mul_ps(dd, _mm512_maskz_loadu_ps(m16, a[t]->scale + 2 * b0));
-            corr[t] = _mm512_fmadd_ps(dd, _mm512_maskz_loadu_ps(m16, a[t]->hx + 2 * b0), corr[t]);
-        }
-        for (int i = 0; i < nb; ++i) {
-            const int b = b0 + i;
-            const __m512i w = unpack64_q2_0(row + (size_t) b * 18 + 2);
-            const __m512i idx = _mm512_add_epi32(base, _mm512_set1_epi32(2 * i));
-            for (int t = 0; t < NT; ++t) {
-                const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w,
-                                                        _mm512_load_si512((const void*) (a[t]->q + b * QK)));
-                acc[t] = _mm512_fmadd_ps(_mm512_permutexvar_ps(idx, p[t]), _mm512_cvtepi32_ps(dot), acc[t]);
-            }
+            const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w,
+                                                    _mm512_load_si512((const void*) (a[t]->q + b * QK)));
+            const __m512 sv = _mm512_mul_ps(dv, as[t * (MAXC / 2) + b]);
+            acc[t] = _mm512_fmadd_ps(sv, _mm512_cvtepi32_ps(dot), acc[t]);
+            corr[t] += d * hxs[t * (MAXC / 2) + b];
         }
     }
-    for (int t = 0; t < NT; ++t) res[t] = _mm512_reduce_add_ps(acc[t]) - _mm512_reduce_add_ps(corr[t]);
+    for (int t = 0; t < NT; ++t) res[t] = _mm512_reduce_add_ps(acc[t]) - corr[t];
 }
 template<int NT>
 void q2g_rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, float* const* out, int r0, int r1) {
+    const __m512i base = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
+    __m512 as[NT * (MAXC / 2)];
+    float hxs[NT * (MAXC / 2)];
+    for (int t = 0; t < NT; ++t)
+        for (int b = 0; b < nblocks; ++b) {
+            as[t * (MAXC / 2) + b] = _mm512_permutexvar_ps(base, _mm512_castps128_ps512(_mm_loadl_pi(_mm_setzero_ps(), (const __m64*) (a[t]->scale + 2 * b))));
+            hxs[t * (MAXC / 2) + b] = a[t]->hx[2 * b] + a[t]->hx[2 * b + 1];
+        }
     float res[NT];
     for (int r = r0; r < r1; ++r) {
-        q2g_row_multi<NT>(w + (size_t) r * row_bytes, a, nblocks, res);
+        q2g_row_multi<NT>(w + (size_t) r * row_bytes, a, as, hxs, nblocks, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
