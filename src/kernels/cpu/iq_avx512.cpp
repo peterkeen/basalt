@@ -501,34 +501,59 @@ void quantize_q8_K_avx512(const float* x, void* dst, int64_t k) {
     block_q8_K* y = (block_q8_K*) dst;
     const int64_t nb = k / QK_K;
     const __m512i top = _mm512_set1_epi32(127);
+    const __m512i one8 = _mm512_set1_epi8(1);
+    const __m512i perm = _mm512_setr_epi32(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
     for (int64_t i = 0; i < nb; ++i, x += QK_K) {
-        __m512 v[QK_K / 16];
-        __m512 am = _mm512_setzero_ps();
-        for (int j = 0; j < QK_K / 16; ++j) {
+        __m512 v[QK_K / 16], av[QK_K / 16];
+        __m512 am0 = _mm512_setzero_ps(), am1 = _mm512_setzero_ps();
+        for (int j = 0; j < QK_K / 16; j += 2) {
             v[j] = _mm512_loadu_ps(x + 16 * j);
-            am = _mm512_max_ps(am, _mm512_abs_ps(v[j]));
+            v[j + 1] = _mm512_loadu_ps(x + 16 * (j + 1));
+            av[j] = _mm512_abs_ps(v[j]);
+            av[j + 1] = _mm512_abs_ps(v[j + 1]);
+            am0 = _mm512_max_ps(am0, av[j]);
+            am1 = _mm512_max_ps(am1, av[j + 1]);
         }
-        const float amax = _mm512_reduce_max_ps(am);
+        am0 = _mm512_max_ps(am0, am1);
+        const __m256 a256 = _mm256_max_ps(_mm512_castps512_ps256(am0), _mm512_extractf32x8_ps(am0, 1));
+        __m128 a128 = _mm_max_ps(_mm256_castps256_ps128(a256), _mm256_extractf128_ps(a256, 1));
+        a128 = _mm_max_ps(a128, _mm_movehl_ps(a128, a128));
+        const float amax = _mm_cvtss_f32(_mm_max_ss(a128, _mm_movehdup_ps(a128)));
         if (amax == 0.f) {
             y[i].d = 0;
             std::memset(y[i].qs, 0, QK_K);
             std::memset(y[i].bsums, 0, sizeof(y[i].bsums));
             continue;
         }
-        // the signed value of the first element of largest magnitude fixes the scale
+        // the signed value of the first element of largest magnitude fixes the scale (branchless across the 16 chunks)
         const __m512 amv = _mm512_set1_ps(amax);
-        float mx = 0.f;
-        for (int j = 0; j < QK_K / 16; ++j) {
-            const __mmask16 m = _mm512_cmp_ps_mask(_mm512_abs_ps(v[j]), amv, _CMP_EQ_OQ);
-            if (m != 0) { mx = x[16 * j + lowest_bit((unsigned) m)]; break; }
+        unsigned mw = 0;
+        int mbase = 0;
+        for (int g = 7; g >= 0; --g) {
+            const unsigned m0 = (unsigned) _mm512_cmp_ps_mask(av[2 * g], amv, _CMP_EQ_OQ);
+            const unsigned m1 = (unsigned) _mm512_cmp_ps_mask(av[2 * g + 1], amv, _CMP_EQ_OQ);
+            const unsigned m = m0 | (m1 << 16);
+            if (m != 0) { mw = m; mbase = 32 * g; }
         }
+        const float mx = x[mbase + lowest_bit(mw)];
         const float iscale = -127.f / mx;
         const __m512 is = _mm512_set1_ps(iscale);
-        for (int j = 0; j < QK_K / 16; ++j) {
-            const __m512i q = _mm512_min_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(is, v[j])), top);
-            _mm_storeu_si128((__m128i*) (y[i].qs + 16 * j), _mm512_cvtepi32_epi8(q));
-            y[i].bsums[j] = (int16_t) _mm512_reduce_add_epi32(q);
+        __m128i bs[4];
+        for (int g = 0; g < 4; ++g) {
+            const int j = 4 * g;
+            const __m512i q0 = _mm512_min_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(is, v[j + 0])), top);
+            const __m512i q1 = _mm512_min_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(is, v[j + 1])), top);
+            const __m512i q2 = _mm512_min_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(is, v[j + 2])), top);
+            const __m512i q3 = _mm512_min_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(is, v[j + 3])), top);
+            // per 128-bit lane: four bytes from each of q0..q3; permute puts the 64 codes in order
+            const __m512i b = _mm512_packs_epi16(_mm512_packs_epi32(q0, q1), _mm512_packs_epi32(q2, q3));
+            _mm512_storeu_si512((void*) (y[i].qs + 16 * j), _mm512_permutexvar_epi32(perm, b));
+            const __m512i s4 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), one8, b);
+            const __m256i s2 = _mm256_add_epi32(_mm512_castsi512_si256(s4), _mm512_extracti64x4_epi64(s4, 1));
+            bs[g] = _mm_add_epi32(_mm256_castsi256_si128(s2), _mm256_extracti128_si256(s2, 1));
         }
+        _mm_storeu_si128((__m128i*) (y[i].bsums + 0), _mm_packs_epi32(bs[0], bs[1]));
+        _mm_storeu_si128((__m128i*) (y[i].bsums + 8), _mm_packs_epi32(bs[2], bs[3]));
         y[i].d = 1 / iscale;
     }
 }

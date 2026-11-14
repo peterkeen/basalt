@@ -1293,6 +1293,29 @@ int check_q8k_quant() {
     if (cpu::cpu_avx512_ok()) failures += check_q8k_one("AVX-512", cpu::quantize_q8_K_avx512);
     else std::printf("q8_K quantizer: no AVX-512 on this CPU, skipped\n");
     if (cpu::cpu_avx2_ok()) failures += check_q8k_one("AVX-2", cpu::quantize_q8_K_avx2);
+    // native_quant_h on a Q8_K down layer (e.g. Q4_K / Q6_K) takes the same SIMD path as native_quant_act
+    cpu::NativeFmt f;
+    std::string err;
+    if (!cpu::native_fmt(GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, H, 512, f, err)) {
+        std::printf("native_fmt(Q4_K, Q6_K): %s\n", err.c_str());
+        return failures + 1;
+    }
+    const auto* tr = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    std::mt19937 rng(42);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> h(512);
+    std::vector<uint8_t> want(f.h_bytes), got(f.h_bytes);
+    for (int it = 0; it < 1000; ++it) {
+        for (float& v : h) v = (it % 5 == 0) ? 0.f : nd(rng);
+        tr->from_float(h.data(), want.data(), 512);
+        cpu::native_quant_h(f, h.data(), got.data());
+        for (int b = 0; b < 2; ++b) {
+            float d;
+            std::memcpy(&d, want.data() + b * 292, 4);
+            if (d == 0.f) std::memset(want.data() + b * 292 + 4 + 256, 0, 32);
+        }
+        if (std::memcmp(want.data(), got.data(), f.h_bytes) != 0) ++failures;
+    }
     return failures;
 }
 

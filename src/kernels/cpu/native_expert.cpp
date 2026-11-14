@@ -136,21 +136,29 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     return true;
 }
 
-void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+namespace {
+
+void quantize_act_row(int type, const float* x, void* dst, int64_t n) {
     static const bool avx512 = cpu_avx512_ok();
-    if (f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
+    if (type == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
         if (avx512) {
-            quantize_q8_K_avx512(x, dst, f.n_embd);
+            quantize_q8_K_avx512(x, dst, n);
             return;
         }
-        quantize_q8_K_avx2(x, dst, f.n_embd);   // the engine runs on AVX2 CPUs at least
+        quantize_q8_K_avx2(x, dst, n);   // the engine runs on AVX2 CPUs at least
         return;
     }
-    traits(f.gu_act)->from_float(x, dst, f.n_embd);
+    traits(type)->from_float(x, dst, n);
+}
+
+}  // namespace
+
+void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    quantize_act_row(f.gu_act, x, dst, f.n_embd);
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
-    traits(f.d_act)->from_float(h, dst, f.n_ff);
+    quantize_act_row(f.d_act, h, dst, f.n_ff);
 }
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
