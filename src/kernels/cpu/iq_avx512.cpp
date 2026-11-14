@@ -3,7 +3,7 @@
 // ggml-cpu's x86 dot products for these formats are AVX2 and single-token: every token re-decodes the weights
 // and a sign is applied with five instructions per 32 values.  Here 64 values are decoded once (8 or 16 grid
 // lookups, one 64-bit sign mask, one vector of scales) and every token applies them with a masked subtract, a
-// `maddubs` and a `madd`.  The arithmetic is ggml's (ggml-cpu/quants.c, the `_generic` references): integer sums
+// `maddubs` and a `dpwssd`.  The arithmetic is ggml's (ggml-cpu/quants.c, the `_generic` references): integer sums
 // per block, times d_x * d_y * the format's constant - only the order of the float additions differs.
 //
 // IQ1_S (19) has an exact kernel, every token bit for bit ggml's single-token dot; so have IQ2_XXS, IQ2_XS and IQ1_M
@@ -11,8 +11,9 @@
 // Multi-token formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22).
 //
 // The sign masks of IQ2_XXS, IQ2_XS and IQ3_XXS are built from their 7-bit indices with BMI2 (pdep, and pext for
-// IQ2_XS) and a byte parity rather than eight table loads.  IQ3_S and IQ2_S, whose grid index takes extra high bits,
-// look the grid up with one gather; the grids indexed by a plain byte keep scalar loads, which are faster there.
+// IQ2_XS) and a byte parity rather than eight table loads.  IQ3_S and IQ2_S index their grids with the quantized byte
+// plus a few high bits: pdep spreads each byte into a 16-bit index lane, the high bits go into the same lanes the same
+// way, and the rows are loaded scalar - every grid here is loaded that way.
 #include "basalt/kernels/cpu/iq_avx512.hpp"
 
 #define GGML_COMMON_DECL_CPP
@@ -103,12 +104,12 @@ template <> struct Fmt<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign bytes
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
         const uint8_t* qs = b + 2 + 8 * j;
-        // grid index l: qs[l] | (2 high bits l of qh) << 8, eight lookups in one gather
-        const int h = (int) b[66 + 2 * j] | ((int) b[66 + 2 * j + 1] << 8);
-        const __m256i hb = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(h), _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14)),
-                                            _mm256_set1_epi32(3));
-        const __m256i idx = _mm256_or_si256(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) qs)), _mm256_slli_epi32(hb, 8));
-        g = _mm512_i32gather_epi64(idx, (const void*) iq2s_grid, 8);
+        const uint32_t h0 = b[66 + 2 * j], h1 = b[66 + 2 * j + 1];
+        const uint64_t a0 = _pdep_u64(u32(qs), 0x00FF00FF00FF00FFull) | _pdep_u64(h0, 0x0300030003000300ull);
+        const uint64_t a1 = _pdep_u64(u32(qs + 4), 0x00FF00FF00FF00FFull) | _pdep_u64(h1, 0x0300030003000300ull);
+#define G2(a, k) (long long) iq2s_grid[(uint16_t) ((a) >> (16 * (k)))]
+        g = _mm512_set_epi64(G2(a1, 3), G2(a1, 2), G2(a1, 1), G2(a1, 0), G2(a0, 3), G2(a0, 2), G2(a0, 1), G2(a0, 0));
+#undef G2
         m = _cvtu64_mask64(u64(b + 2 + 32 + 8 * j));
         const uint8_t s0 = b[74 + 2 * j], s1 = b[74 + 2 * j + 1];
         sc = scales4(2 * (s0 & 15) + 1, 2 * (s0 >> 4) + 1, 2 * (s1 & 15) + 1, 2 * (s1 >> 4) + 1);
@@ -137,13 +138,17 @@ template <> struct Fmt<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
     static constexpr float K = 1.0f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
         const uint8_t* q = b + 2 + 16 * j;
-        // grid index l: q[l] | (high bit l of qh) << 8, sixteen lookups in one gather
-        const int h = (int) b[66 + 2 * j] | ((int) b[66 + 2 * j + 1] << 8);
-        const __m512i hb = _mm512_and_si512(_mm512_srlv_epi32(_mm512_set1_epi32(h),
-                                                              _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)),
-                                            _mm512_set1_epi32(1));
-        const __m512i idx = _mm512_or_si512(_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) q)), _mm512_slli_epi32(hb, 8));
-        g = _mm512_i32gather_epi32(idx, (const void*) iq3s_grid, 4);
+        const uint32_t h0 = b[66 + 2 * j], h1 = b[66 + 2 * j + 1];
+        const uint64_t q0 = u64(q), q1 = u64(q + 8);
+        const uint64_t i0 = _pdep_u64(q0, 0x00FF00FF00FF00FFull) | _pdep_u64(h0, 0x0100010001000100ull);
+        const uint64_t i1 = _pdep_u64(q0 >> 32, 0x00FF00FF00FF00FFull) | _pdep_u64(h0 >> 4, 0x0100010001000100ull);
+#define G3(w, k) (int) iq3s_grid[(uint16_t) ((w) >> (16 * (k)))]
+        const __m256i glo = _mm256_set_epi32(G3(i1, 3), G3(i1, 2), G3(i1, 1), G3(i1, 0), G3(i0, 3), G3(i0, 2), G3(i0, 1), G3(i0, 0));
+        const uint64_t i2 = _pdep_u64(q1, 0x00FF00FF00FF00FFull) | _pdep_u64(h1, 0x0100010001000100ull);
+        const uint64_t i3 = _pdep_u64(q1 >> 32, 0x00FF00FF00FF00FFull) | _pdep_u64(h1 >> 4, 0x0100010001000100ull);
+        const __m256i ghi = _mm256_set_epi32(G3(i3, 3), G3(i3, 2), G3(i3, 1), G3(i3, 0), G3(i2, 3), G3(i2, 2), G3(i2, 1), G3(i2, 0));
+#undef G3
+        g = _mm512_inserti64x4(_mm512_castsi256_si512(glo), ghi, 1);
         m = _cvtu64_mask64(u64(b + 74 + 8 * j));
         const uint8_t s = b[106 + j];
         const int sa = 2 * (s & 15) + 1, sb = 2 * (s >> 4) + 1;
@@ -206,7 +211,7 @@ inline void iq1s_row_dot(const uint8_t* row, int nb, const block_q8_K* const* y,
             for (int t = 0; t < NT; ++t) {
                 const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
                 const __m512i ys = _mm512_mask_sub_epi8(yv, gm, zero, yv);
-                acc[t] = _mm512_add_epi32(acc[t], _mm512_madd_epi16(_mm512_maddubs_epi16(ga, ys), lsj));
+                acc[t] = _mm512_dpwssd_epi32(acc[t], _mm512_maddubs_epi16(ga, ys), lsj);
             }
         }
         const float dw = h2f(u16(blk));
@@ -245,7 +250,7 @@ inline void row_dot_exact(const uint8_t* row, int nb, const block_q8_K* const* y
             for (int t = 0; t < NT; ++t) {
                 const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
                 const __m512i ys = _mm512_mask_sub_epi8(yv, m, zero, yv);
-                acc[t] = _mm512_add_epi32(acc[t], _mm512_madd_epi16(_mm512_maddubs_epi16(g, ys), sc));
+                acc[t] = _mm512_dpwssd_epi32(acc[t], _mm512_maddubs_epi16(g, ys), sc);
             }
         }
         const float dw = h2f(u16(blk));
@@ -292,8 +297,8 @@ inline void iq1m_row_dot(const uint8_t* row, int nb, const block_q8_K* const* y,
                 const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
                 const __m512i dot = _mm512_maddubs_epi16(ga, _mm512_mask_sub_epi8(yv, gm, zero, yv));
                 const __m512i dd = _mm512_maddubs_epi16(one8, _mm512_mask_sub_epi8(yv, ds, zero, yv));
-                acc1[t] = _mm512_add_epi32(acc1[t], _mm512_madd_epi16(dot, ls));
-                acc2[t] = _mm512_add_epi32(acc2[t], _mm512_madd_epi16(dd, ls));
+                acc1[t] = _mm512_dpwssd_epi32(acc1[t], dot, ls);
+                acc2[t] = _mm512_dpwssd_epi32(acc2[t], dd, ls);
             }
         }
         const float dw = h2f(scale.u16);
@@ -425,7 +430,7 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
             for (int t = 0; t < NT; ++t) {
                 const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
                 const __m512i ys = _mm512_mask_sub_epi8(yv, m, zero, yv);
-                acci[t] = _mm512_add_epi32(acci[t], _mm512_madd_epi16(_mm512_maddubs_epi16(g, ys), sc));
+                acci[t] = _mm512_dpwssd_epi32(acci[t], _mm512_maddubs_epi16(g, ys), sc);
             }
         }
         const float dx = h2f(u16(blk)) * Fmt<TY>::K;
