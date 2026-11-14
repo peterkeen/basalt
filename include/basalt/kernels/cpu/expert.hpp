@@ -48,41 +48,12 @@ struct ActQ {
     int nchunks;
 };
 
-/// Runtime CPU feature check.  The kernel uses AVX512-VNNI + AVX512-VBMI + AVX512VL, and code compiled with
-/// `/arch:AVX512` can emit AVX-512 anywhere in its translation unit, so a machine without them must be
-/// REFUSED rather than silently run.  `s2_expert_scalar` is the fallback and exists for tests.
-struct CpuFeatures {
-    bool avx512f = false;
-    bool avx512bw = false;
-    bool avx512vl = false;
-    bool avx512_vnni = false;
-    bool avx512_vbmi = false;
-    bool usable() const { return avx512f && avx512bw && avx512vl && avx512_vnni && avx512_vbmi; }
-    /// A one-line description of what is missing, or "ok".
-    const char* reason() const;
-};
-CpuFeatures cpu_features();
-
 /// `x` -> `a` in the configured contract. The function name is historical;
-/// `n` must be a multiple of QKA and at most H. No allocation occurs.
+/// `n` must be a multiple of QKA and at most kActMaxWidth. No allocation occurs.
 void act_quant_q8_1(const float* x, int n, ActQ& a);
 
-/// Plan v0.3 P6: ONE expert applied to up to MAXT tokens that were all routed to it (a speculative verify
-/// window routes ~1.5 tokens to each distinct expert). The 1.38 MB blob is read and its 2-bit codes unpacked
-/// ONCE per block for all tokens; only the VNNI dot and the accumulation run per token. Every token's output
-/// is bitwise equal to `s2_expert_vnni_q` on that token (same operation order per token). A batch above `MAXT` runs one `s2_expert_vnni_q` per token.
 inline constexpr int MAXT = 8;
-/// The scalar transcription of ggml's formula - NOT a second opinion, but the ORACLE the VNNI path is checked
-/// against, and the only path available on a CPU without AVX-512.
-///
-/// `quant_acts` makes the oracle consume the SAME INT8 activation values the VNNI path uses, **at BOTH
-/// stages**.  With it OFF the oracle is exact-FP32-activation and the gap between them IS the activation
-/// contract; with it ON the two differ only by FP32 evaluation order, so a small gap there proves the kernel
-/// itself correct.  That separation is why this parameter exists rather
-/// than two functions.
-///
-/// Both stages quantize: leaving the gate/up projections on raw f32 `x` is invisible when the caller passes
-/// an already-quantized input, as the engine does, and shows up as a gap otherwise.
+
 /// Rows [r0, r1) of a Q2_0 matrix in the GGUF block layout (18 bytes per 64 weights, `row_bytes`
 /// per row, `nblocks` blocks each) against `nt` activations: out[t][r].
 void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
