@@ -1657,6 +1657,11 @@ if(BUILD_TESTING)
   add_executable(avx_bench tests/kernels/cpu/avx_bench.cpp)
   target_link_libraries(avx_bench PRIVATE kernels_cpu)
 
+  # the CPU expert rows on a .basalt pack's own expert blobs (timing and output hash; run it by hand)
+  add_executable(expert_pack_bench tests/kernels/cpu/expert_pack_bench.cpp)
+  target_link_libraries(expert_pack_bench PRIVATE kernels_cpu artifact model_file)
+  basalt_embed_manifest(expert_pack_bench)
+
   # needs the AVX-512 VNNI and VBMI instruction sets, which not every host has
   add_executable(nvfp4_cpu_rows_test tests/kernels/cpu/nvfp4_cpu_rows_test.cpp)
   target_link_libraries(nvfp4_cpu_rows_test PRIVATE kernels_cpu)
