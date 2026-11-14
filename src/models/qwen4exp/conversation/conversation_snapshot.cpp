@@ -313,7 +313,7 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     if (paged_host) {
         HostKvTable& tab = const_cast<HostKvTable&>(st.host_tab);
         st.host_pool->release_range(tab, n1, /*keep_spare=*/true);
-        if (n1 > 0 && !st.host_pool->ensure_writable(tab, 0, n1, error)) return false;
+        if (n1 > 0 && !st.host_pool->ensure_writable(tab, 0, n1, error, nullptr, /*zero_fresh=*/false)) return false;
     }
     auto page_slice_mut = [](basalt::kernels::HostKvPage* hp, size_t arr_idx) -> uint8_t* {
         if (hp == nullptr) return nullptr;
@@ -391,7 +391,7 @@ bool conversation_kv_copy(QsaState& from, QsaState& to, const ModelGeometry& g, 
             if (!to.host_pool->clone_range(to.host_tab, from.host_tab, upto, error)) return false;
         } else if (!from_paged && from.kv_mode == 0 && to_paged) {
             to.host_pool->release_range(to.host_tab, n1, /*keep_spare=*/true);
-            if (n1 > 0 && !to.host_pool->ensure_writable(to.host_tab, 0, n1, error)) return false;
+            if (n1 > 0 && !to.host_pool->ensure_writable(to.host_tab, 0, n1, error, nullptr, /*zero_fresh=*/false)) return false;
             if (n1 > 0) basalt::kernels::kv_scatter_to_host_paged(qsa_attn_pools(from), to.host.paged, n1, shapes, nullptr);
             if (cudaDeviceSynchronize() != cudaSuccess) {
                 error = std::string("conversation snapshot scatter: ") + cudaGetErrorString(cudaGetLastError());

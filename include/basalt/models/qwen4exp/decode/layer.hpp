@@ -285,8 +285,10 @@ HostKvPool& qsa_host_kv_pool();
 bool qsa_host_kv_ensure(QsaState& st, int64_t cell_lo, int64_t cell_hi, std::string& err, void* stream = nullptr);
 /// Dynamic KV tiering (`0 <-> 1`) for an elastic INT8 QSA layer with a pre-carved streaming map.
 bool qsa_can_stream(const QsaState& st);
-bool qsa_state_demote_to_stream(QsaState& st, const ModelGeometry& g, int64_t live_cells, std::string& err);
-bool qsa_state_promote_to_vram(QsaState& st, const ModelGeometry& g, int64_t live_cells, int64_t map_cells, std::string& err);
+bool qsa_state_demote_to_stream(QsaState& st, const ModelGeometry& g, int64_t live_cells, std::string& err,
+                                bool defer_unmap = false);
+bool qsa_state_promote_to_vram(QsaState& st, const ModelGeometry& g, int64_t live_cells, int64_t map_cells,
+                               std::string& err, bool defer_release = false);
 bool qsa_state_reset_to_vram(QsaState& st, int64_t floor_cells, std::string& err);
 /// Store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and initializing the
 /// session; default off.

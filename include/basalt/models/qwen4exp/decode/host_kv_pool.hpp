@@ -49,7 +49,8 @@ public:
 
     /// Ensures logical pages `[page_lo, page_hi)` in `tab` are allocated and uniquely owned (`refcount == 1`),
     /// COW-splitting any shared page (`refcount > 1`) and uploading dirtied entries to `tab.d_pages`.
-    bool ensure_writable(HostKvTable& tab, int64_t page_lo, int64_t page_hi, std::string& err, void* stream = nullptr);
+    bool ensure_writable(HostKvTable& tab, int64_t page_lo, int64_t page_hi, std::string& err, void* stream = nullptr,
+                         bool zero_fresh = true);
 
     /// Zero-copy prefix clone: `dst` shares pages `[0, (upto_cells + 3) / 4)` of `src` by bumping refcounts.
     bool clone_range(HostKvTable& dst, HostKvTable& src, int64_t upto_cells, std::string& err, void* stream = nullptr);
@@ -81,8 +82,6 @@ private:
     struct Slab {
         uint8_t* host = nullptr;
         uint8_t* dev = nullptr;
-        void* mapping_base = nullptr;
-        uint64_t mapping_bytes = 0;
         int32_t used_pages = 0;
         int32_t next_fresh = 0;
         bool registered = false;

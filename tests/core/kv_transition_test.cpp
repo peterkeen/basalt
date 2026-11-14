@@ -197,6 +197,32 @@ int main() {
         check(basalt::platform::remove_file(dir), "remove spill directory");
         check(qsa_state_reset_to_vram(b.st, 4096, err), "discard streamed session", err);
         check(qsa_host_kv_pool().pinned_bytes() == 0, "discard frees all slabs");
+        // Batched session-wide demotion and promotion across multiple QSA layers.
+        check(a.st.kv_arena->map(Fixture::cells, err) && a.st.idx_arena->map(Fixture::cells, err), "map session a", err);
+        check(b.st.kv_arena->map(Fixture::cells, err) && b.st.idx_arena->map(Fixture::cells, err), "map session b", err);
+        a.fill(41);
+        b.fill(73);
+        ConversationKv img_a, img_b;
+        check(conversation_kv_save(img_a, a.st, a.g, live, true, err), "save session a", err);
+        check(conversation_kv_save(img_b, b.st, b.g, live, true, err), "save session b", err);
+        QsaState pair[2] = {a.st, b.st};
+        SessionState sess;
+        sess.max_cells = Fixture::cells;
+        sess.qsa_ord0 = 0;
+        sess.qsa_alloc = 2;
+        sess.qsa_states = pair;
+        check(session_demote_to_stream(sess, a.g, live, err), "batched session demote", err);
+        a.st = pair[0];
+        b.st = pair[1];
+        check(session_is_streamed(sess), "session streamed");
+        verify(img_a, a, live);
+        verify(img_b, b, live);
+        check(session_promote_to_vram(sess, a.g, live, Fixture::cells, err), "batched session promote", err);
+        a.st = pair[0];
+        b.st = pair[1];
+        check(!session_is_streamed(sess) && qsa_host_kv_pool().pinned_bytes() == 0, "session promoted and slabs freed");
+        verify(img_a, a, live);
+        verify(img_b, b, live);
     }
     qsa_set_kv_elastic(0);
     qsa_set_kv_int8(false);

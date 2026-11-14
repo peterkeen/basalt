@@ -272,12 +272,30 @@ bool session_demote_to_stream(SessionState& s, const ModelGeometry& g, int64_t l
         err = "session cannot dynamically stream to host RAM";
         return false;
     }
+    const int64_t page_size = basalt::kernels::qsa_real_shapes().page_size;
+    auto rollback = [&](int64_t upto) {
+        std::string rerr;
+        (void) cudaDeviceSynchronize();
+        const int64_t map_back = std::max(live_cells, qsa_kv_resident_min());
+        for (int64_t i = 0; i < upto; ++i)
+            (void) qsa_state_promote_to_vram(s.qsa_states[s.qsa_ord0 + i], g, live_cells, map_back, rerr);
+    };
     for (int64_t j = 0; j < s.qsa_alloc; ++j) {
-        if (!qsa_state_demote_to_stream(s.qsa_states[s.qsa_ord0 + j], g, live_cells, err)) {
-            std::string rerr;
-            const int64_t map_back = std::max(live_cells, qsa_kv_resident_min());
-            for (int64_t i = 0; i < j; ++i)
-                (void) qsa_state_promote_to_vram(s.qsa_states[s.qsa_ord0 + i], g, live_cells, map_back, rerr);
+        if (!qsa_state_demote_to_stream(s.qsa_states[s.qsa_ord0 + j], g, live_cells, err, /*defer_unmap=*/true)) {
+            rollback(j);
+            return false;
+        }
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = std::string("demoting KV to host RAM failed: ") + cudaGetErrorString(cudaGetLastError());
+        rollback(s.qsa_alloc);
+        return false;
+    }
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+        QsaState& q = s.qsa_states[s.qsa_ord0 + j];
+        const int64_t stream_cells = std::min(q.max_cells, q.map.n_slots * page_size);
+        if (!q.kv_arena->unmap(stream_cells, err)) {
+            rollback(s.qsa_alloc);
             return false;
         }
     }
@@ -285,13 +303,36 @@ bool session_demote_to_stream(SessionState& s, const ModelGeometry& g, int64_t l
 }
 
 bool session_promote_to_vram(SessionState& s, const ModelGeometry& g, int64_t live_cells, int64_t map_cells, std::string& err) {
+    auto rollback = [&](int64_t upto) {
+        std::string rerr;
+        (void) cudaDeviceSynchronize();
+        for (int64_t i = 0; i < upto; ++i) {
+            QsaState& q = s.qsa_states[s.qsa_ord0 + i];
+            q.kv_mode = 0;
+            q.n_slots = q.n_pages;
+            (void) qsa_state_demote_to_stream(q, g, live_cells, rerr);
+        }
+    };
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
-        if (!qsa_state_promote_to_vram(s.qsa_states[s.qsa_ord0 + j], g, live_cells, map_cells, err)) {
-            std::string rerr;
-            for (int64_t i = 0; i < j; ++i)
-                (void) qsa_state_demote_to_stream(s.qsa_states[s.qsa_ord0 + i], g, live_cells, rerr);
+        if (!qsa_state_promote_to_vram(s.qsa_states[s.qsa_ord0 + j], g, live_cells, map_cells, err,
+                                       /*defer_release=*/true)) {
+            rollback(j);
             return false;
         }
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = std::string("promoting KV back to VRAM failed: ") + cudaGetErrorString(cudaGetLastError());
+        rollback(s.qsa_alloc);
+        return false;
+    }
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+        QsaState& q = s.qsa_states[s.qsa_ord0 + j];
+        if (q.kv_mode != 1) continue;
+        if (q.host_pool != nullptr)
+            q.host_pool->release_range(q.host_tab, 0, /*keep_spare=*/j + 1 < s.qsa_alloc);
+        q.host = basalt::kernels::KvHostPools{};
+        q.kv_mode = 0;
+        q.n_slots = q.n_pages;
     }
     return true;
 }

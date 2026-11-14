@@ -487,7 +487,8 @@ bool qsa_can_stream(const QsaState& st) {
            st.host_pool != nullptr && st.map.ctl != nullptr && st.map.n_slots >= basalt::kernels::kKvStreamMinSlots;
 }
 
-bool qsa_state_demote_to_stream(QsaState& st, const ModelGeometry& g, int64_t live_cells, std::string& err) {
+bool qsa_state_demote_to_stream(QsaState& st, const ModelGeometry& g, int64_t live_cells, std::string& err,
+                                bool defer_unmap) {
     if (st.kv_mode == 1) return true;
     if (!qsa_can_stream(st)) {
         err = "QSA state cannot dynamically stream to host RAM";
@@ -499,7 +500,8 @@ bool qsa_state_demote_to_stream(QsaState& st, const ModelGeometry& g, int64_t li
     live_cells = std::clamp<int64_t>(live_cells, 0, st.kv_arena->cells());
     const int64_t pages = (live_cells + s.page_size - 1) / s.page_size;
     st.host_pool->release_range(st.host_tab, pages, /*keep_spare=*/true);
-    if (pages > 0 && !st.host_pool->ensure_writable(st.host_tab, 0, pages, err)) return false;
+    if (pages > 0 && !st.host_pool->ensure_writable(st.host_tab, 0, pages, err, nullptr, /*zero_fresh=*/false))
+        return false;
     uint8_t* const* d_slabs = st.host_pool->device_slabs(st.host_tab.device);
     if (d_slabs == nullptr) {
         err = "HostKvPool: device slab directory allocation failed";
@@ -508,19 +510,20 @@ bool qsa_state_demote_to_stream(QsaState& st, const ModelGeometry& g, int64_t li
     const basalt::kernels::HostKvView paged{d_slabs, st.host_tab.d_pages};
     if (pages > 0) basalt::kernels::kv_scatter_to_host_paged(qsa_attn_pools(st), paged, pages, s, nullptr);
     basalt::kernels::kv_stream_warm_recent(st.map, qsa_attn_pools(st), pages, s, nullptr);
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-        err = std::string("demoting KV to host RAM failed: ") + cudaGetErrorString(cudaGetLastError());
-        return false;
-    }
-    if (!st.kv_arena->unmap(stream_cells, err)) return false;
     st.host = basalt::kernels::KvHostPools{};
     st.host.paged = paged;
     st.kv_mode = 1;
     st.n_slots = st.map.n_slots;
-    return true;
+    if (defer_unmap) return true;
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = std::string("demoting KV to host RAM failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return st.kv_arena->unmap(stream_cells, err);
 }
 
-bool qsa_state_promote_to_vram(QsaState& st, const ModelGeometry& g, int64_t live_cells, int64_t map_cells, std::string& err) {
+bool qsa_state_promote_to_vram(QsaState& st, const ModelGeometry& g, int64_t live_cells, int64_t map_cells,
+                               std::string& err, bool defer_release) {
     if (st.kv_mode == 0) return true;
     if (st.kv_mode != 1 || st.kv_arena == nullptr || st.host_pool == nullptr) {
         err = "QSA state cannot promote back to VRAM";
@@ -536,6 +539,7 @@ bool qsa_state_promote_to_vram(QsaState& st, const ModelGeometry& g, int64_t liv
     if (pages > 0)
         basalt::kernels::kv_stage_from_host(qsa_attn_pools(st), st.host, basalt::kernels::kKvInt8, pages, s, nullptr);
     basalt::kernels::kv_ring_table(st.page_table, st.n_pages, st.n_pages, nullptr);
+    if (defer_release) return true;
     if (cudaDeviceSynchronize() != cudaSuccess) {
         err = std::string("promoting KV back to VRAM failed: ") + cudaGetErrorString(cudaGetLastError());
         return false;
@@ -954,7 +958,7 @@ bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometr
     const bool sp = sh && src.host.paged.present() && src.host_pool != nullptr;
     const int64_t p0 = cell0 / s.page_size, p1 = (cell1 + s.page_size - 1) / s.page_size;
     bool ok = true;
-    if (dp && !dst.host_pool->ensure_writable(dst.host_tab, p0, p1, err)) return false;
+    if (dp && !dst.host_pool->ensure_writable(dst.host_tab, p0, p1, err, nullptr, /*zero_fresh=*/false)) return false;
     if (dp || sp) {
         for (int64_t p = p0; ok && p < p1; ++p) {
             basalt::kernels::HostKvPage* dhp = dp ? dst.host_pool->page_ptr(dst.host_tab.h_pages[(size_t) p]) : nullptr;

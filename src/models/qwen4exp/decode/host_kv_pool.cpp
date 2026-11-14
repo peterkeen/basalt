@@ -112,18 +112,12 @@ bool HostKvPool::open_slab_locked(int idx, std::string& err) {
         refcount_.resize(slabs_.size() * (size_t) kSlabPages, 0);
     }
     Slab& s = slabs_[(size_t) idx];
-    basalt::platform::RegionBacking got = basalt::platform::RegionBacking::NormalPages;
-    std::string note;
-    void* map_base = nullptr;
-    uint64_t map_bytes = 0;
-    void* p = basalt::platform::alloc_region(kSlabBytes, got, note, "", 0, map_base, map_bytes);
+    void* p = basalt::platform::alloc_aligned((size_t) kSlabBytes, 2ull << 20);
     if (p == nullptr) {
-        err = "HostKvPool: cannot allocate 132 MiB KV slab (" + note + ")";
+        err = "HostKvPool: cannot allocate 132 MiB KV slab";
         return false;
     }
     s.host = (uint8_t*) p;
-    s.mapping_base = map_base ? map_base : p;
-    s.mapping_bytes = map_bytes ? map_bytes : kSlabBytes;
     s.used_pages = 0;
     s.next_fresh = 0;
     s.free_list.clear();
@@ -137,7 +131,7 @@ bool HostKvPool::open_slab_locked(int idx, std::string& err) {
         if (re != cudaSuccess || cudaHostGetDevicePointer(&dev_ptr, s.host, 0) != cudaSuccess) {
             const cudaError_t ce = re != cudaSuccess ? re : cudaGetLastError();
             if (re == cudaSuccess) cudaHostUnregister(s.host);
-            basalt::platform::free_region(s.mapping_base, s.mapping_bytes);
+            basalt::platform::free_aligned(s.host);
             s = Slab{};
             err = std::string("HostKvPool: cudaHostRegister failed for 132 MiB slab: ") + cudaGetErrorString(ce);
             return false;
@@ -166,8 +160,7 @@ void HostKvPool::free_slab_locked(int idx) {
         (void) cudaHostUnregister(s.host);
         s.registered = false;
     }
-    basalt::platform::free_region(s.mapping_base ? s.mapping_base : s.host,
-                                  s.mapping_bytes ? s.mapping_bytes : kSlabBytes);
+    basalt::platform::free_aligned(s.host);
     s = Slab{};
 }
 
@@ -243,7 +236,8 @@ bool HostKvPool::upload_slice_locked(const HostKvTable& tab, int64_t lo, int64_t
     return false;
 }
 
-bool HostKvPool::ensure_writable(HostKvTable& tab, int64_t page_lo, int64_t page_hi, std::string& err, void* stream) {
+bool HostKvPool::ensure_writable(HostKvTable& tab, int64_t page_lo, int64_t page_hi, std::string& err, void* stream,
+                                 bool zero_fresh) {
     page_lo = std::max<int64_t>(0, page_lo);
     page_hi = std::min<int64_t>(page_hi, (int64_t) tab.h_pages.size());
     if (page_hi <= page_lo) return true;
@@ -270,7 +264,7 @@ bool HostKvPool::ensure_writable(HostKvTable& tab, int64_t page_lo, int64_t page
         if (old_p >= 0) {
             std::memcpy(dst, page_ptr(old_p), sizeof(basalt::kernels::HostKvPage));
             dec_ref_locked(old_p);
-        } else {
+        } else if (zero_fresh) {
             std::memset(dst, 0, sizeof(basalt::kernels::HostKvPage));
         }
         tab.h_pages[(size_t) b] = new_p;
