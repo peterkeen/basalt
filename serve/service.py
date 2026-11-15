@@ -13,6 +13,7 @@ from typing import Iterator
 
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.engine.mock import Engine
+from serve.engine.timings import RunTotals
 from serve.frontend import ChatTemplate, Event, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
@@ -1115,7 +1116,7 @@ class Service:
         if force and not thinking:                      # the parser reads it as if the model had written it
             opening, force = parser.feed(self.dialect.nothink_lead + force), None
         tail = ""                                       # the last characters written (the newlines before a call)
-        reused0 = None                                  # reused prefix of the request's first engine run
+        runs = RunTotals()                              # every engine pass of this API request
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (--debug)
         emb = getattr(self.embeddings, "path", None)
@@ -1198,6 +1199,7 @@ class Service:
                         # next pass extends exactly what it holds and reads only the close
                         soft = threading.Event() if soft_stops else None
                         more = {"stop_soon": soft} if soft is not None else {}
+                        pass_last0 = getattr(self.engine, "last", None)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb,
                                                    session=session, **more) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel, session=session, **more)
@@ -1318,10 +1320,9 @@ class Service:
                                 self._say_died(e)
                                 if not leaving and not cancel.is_set():
                                     raise
-                        run_last = getattr(self.engine, "last", None)
-                        if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
-                                and run_last.get("reused") is not None:
-                            reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
+                            finally:
+                                run_last = getattr(self.engine, "last", None)
+                                runs.add(run_last if isinstance(run_last, dict) and run_last is not pass_last0 else {})
                         if drained and soft is not None and soft.is_set() and n < max_new and not cancel.is_set():
                             if parser.state == "reasoning" and not parser.buf and not detok.pending():
                                 wrap = asked = True
@@ -1388,11 +1389,9 @@ class Service:
                     # settle status and history under the fifo, before the next request sets its own
                     with self.status_lock:
                         if st.get("busy"):
-                            # same object as before: no DONE arrived
-                            last = dict(getattr(self.engine, "last", {}) or {}) \
-                                if getattr(self.engine, "last", None) is not engine_last0 else {}
-                            if reused0 is not None and last.get("reused") is not None:
-                                last["reused"] = reused0
+                            last = runs.result()
+                            if last.get("reused") is not None:
+                                last["reused"] = min(int(last["reused"]), len(ids))
                             started = st.get("started", time.time())
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
                             # experts read over PCIe or computed elsewhere are not in the hit rate's lookups
@@ -1535,11 +1534,12 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
         return None
     cache_n = int(last.get("reused") or 0)
     prompt_n, prompt_ms, decode_ms = max(0, prompt_tokens - cache_n), float(last["prompt_ms"]), float(last.get("decode_ms") or 0)
-    decoded = int(last.get("generated") or generated)          # the engine's count gives the rate
+    decoded = int(last["generated"]) if last.get("generated") is not None else generated
     return {"cache_n": cache_n, "prompt_n": prompt_n, "prompt_ms": round(prompt_ms, 1),
             "prompt_per_token_ms": round(prompt_ms / prompt_n, 3) if prompt_n else None,
             "prompt_per_second": round(prompt_n / (prompt_ms / 1000), 1) if prompt_n and prompt_ms > 0 else None,
-            "predicted_n": generated, "predicted_ms": round(decode_ms, 1),
+            # Native timing counts exclude the reasoning-close tokens inserted by the server; usage includes them.
+            "predicted_n": decoded, "predicted_ms": round(decode_ms, 1),
             "predicted_per_token_ms": round(decode_ms / decoded, 3) if decoded else None,
             "predicted_per_second": round(decoded / (decode_ms / 1000), 1) if decoded and decode_ms > 0 else None,
             # draft counts only when reported

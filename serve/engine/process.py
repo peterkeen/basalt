@@ -45,6 +45,7 @@ from serve.engine import lifeline, suspend
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, split_err
 from serve.engine.slots import AdmissionQueue
+from serve.engine.timings import RunTotals
 from serve.prompt import PromptText
 from serve.util.console import tagged
 from serve.engine.progress import narrate_start, server_line, start_errors, start_failure_hint, start_last_line
@@ -887,24 +888,9 @@ class ProcessEngine:
         prev = {k: v for k, v in self.last.items() if k not in ("drafts_accepted", "drafts_offered")}
         counts = {"drafts_accepted": int(f[5]), "drafts_offered": int(f[6])} \
             if len(f) >= 7 and f[5].isdigit() and f[6].isdigit() else {}
-        self.last = {**prev, **counts, "finish": f[3], "decode_ms": float(f[4]),
+        self.last = {**prev, **counts, "finish": f[3],
+                     "decode_ms": float(prev.get("decode_ms") or 0) + float(f[4]),
                      "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
-
-    def _carry_drafts(self, carry: list[int], final: bool):
-        """Draft counts of a request that ran in several engine runs (solo, then a slot, ...): the run just read adds
-        to `carry`; at the request's last run `carry` joins its counts."""
-        last = self.last
-        if not isinstance(last, dict) or last.get("drafts_offered") is None or last.get("drafts_accepted") is None:
-            if final:
-                carry[:] = [0, 0]
-            return
-        if final:
-            last["drafts_accepted"] += carry[0]
-            last["drafts_offered"] += carry[1]
-            carry[:] = [0, 0]
-        else:
-            carry[0] += last["drafts_accepted"]
-            carry[1] += last["drafts_offered"]
 
     def _note_live(self, line: str):
         """A `PL <position> <total> <ms> <tok/s>` line: the display's position and speed inside a chunk."""
@@ -923,20 +909,20 @@ class ProcessEngine:
         if not first and isinstance(last, dict) and last is not last0 and last.get("reused") is not None:
             first.append(last["reused"])
 
-    def _carry_run(self, carry: list[int], first: list, last0, final: bool):
-        """After an engine run: carry the draft counts and, at the request's last run, report the first run's reuse
-        and the prompt-read time of all its runs (a later run only re-reads the token the slot lacks)."""
+    def _carry_run(self, carry: RunTotals, first: list, last0, final: bool):
+        """Settle a completed solo or batch run, retaining the whole reply's times and counters."""
         self._note_first_reused(first, last0)
         last = self.last
-        if final and isinstance(last, dict) and last is not last0:
-            if first:
-                last["reused"] = first[0]
-            if self.read_ms > 0:
-                # the read count of the whole request belongs beside the read time of all its runs, else a later run
-                # that re-reads almost nothing reports a stamp-sized prompt_ms for the whole prompt
+        if isinstance(last, dict) and last is not last0:
+            carry.add(last)
+            if final:
+                last = carry.result()
+                if first:
+                    last["reused"] = first[0]
+                # Includes partial prompt reads that yielded before admission completed.
                 last["prompt_ms"] = self.read_ms
-            first.clear()
-        self._carry_drafts(carry, final)
+                self.last = last
+                first.clear()
 
     BDONE_WAIT_S = 2.0   # a leaving consumer waits this long for its slot's BDONE (the request's draft counts)
 
@@ -1028,7 +1014,7 @@ class ProcessEngine:
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
         yields, solo_again = 0, 0
-        carry = [0, 0]            # draft counts (accepted, offered) of the runs before the current one
+        carry = RunTotals()      # completed runs of this reply
         first, last0 = [], self.last   # reused prefix of the first run; `last` before this request's first DONE
         self.read_ms = 0.0             # the prompt-read time of every run this request makes
         try:
@@ -1199,6 +1185,7 @@ class ProcessEngine:
                 self.ctl.release()
                 holding = False
                 if not cont:
+                    self._carry_run(carry, first, last0, True)
                     return
                 notok = bool(self._ctl_result and len(self._ctl_result) > 2 and self._ctl_result[2])
                 gen0 = len(out) if notok else len(out) - 1  # the admission's token, if any; the slot feeds it first
@@ -1323,7 +1310,6 @@ class ProcessEngine:
                         # the BDONE is still to come: the counts of the DONE before it are not this request's
                         for k in ("drafts_accepted", "drafts_offered"):
                             self.last.pop(k, None)
-                        carry[:] = [0, 0]
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False

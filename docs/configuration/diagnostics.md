@@ -31,6 +31,18 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--decode-timing` | serve | One line per request on where decode time went. |
 | `--draft-log FILE` | serve | One line per verify window (width, accepted, time). |
 
+### HTTP request timings
+
+The API's `timings` and `/v1/status` sum completed engine runs across solo/batch transitions and
+reasoning or tool continuations. `cache_n` counts only reuse present when the request began, not
+its own intermediate tokens. Prompt and decode times are engine intervals, not client wall time;
+queueing, transport and other untimed work can make first output slower.
+
+`predicted_n` counts engine-generated tokens. API `usage.completion_tokens` also counts any
+reasoning-close or tool-opening tokens inserted by the server, so it can differ. Decode rates
+use `predicted_n` and the summed decode time. Optional counters are omitted if any run did not
+report them, rather than presenting a partial sum as the whole request.
+
 ## Dumps and speculation tests
 
 | Flag | Binary | What it does |

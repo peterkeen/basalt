@@ -160,8 +160,10 @@ class Totals(unittest.TestCase):
         self.assertEqual(t["written"], sum(r["output_tokens"] for r in rows))
         self.assertEqual(t["prompt"], sum(r["prompt_tokens"] for r in rows))
         self.assertEqual(t["reused"], 3 * n)
-        self.assertAlmostEqual(t["prompt_ms"], 40.0 * n)
-        self.assertAlmostEqual(t["decode_ms"], 20.0 * n)
+        # The mock ends inside thinking: each API request runs the engine twice, including the answer continuation.
+        self.assertAlmostEqual(t["prompt_ms"], 80.0 * n)
+        self.assertAlmostEqual(t["decode_ms"], 40.0 * n)
+        self.assertAlmostEqual(t["prompt_ms"], sum(r["prompt_ms"] for r in rows))
         self.assertGreater(t["written"], 0)
 
 
