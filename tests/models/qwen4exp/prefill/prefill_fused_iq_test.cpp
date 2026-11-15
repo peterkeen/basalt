@@ -390,9 +390,9 @@ void reference_part(const Pair& p, cudaStream_t s) {
     if (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst)
         throw std::runtime_error(std::string(p.name) + ": the fused path's error is not comparable to MMQ's");
 
-    // v2 (the v2 kernels: IQ3_XXS gate/up, IQ4_NL down): against the reference as above, and next to the kernels
-    // above it differs only in the rounding order (H's int8 codes may move by one)
-    if (p.gu == GGML_TYPE_IQ3_XXS || p.d == GGML_TYPE_IQ4_NL) {
+    // v2 against the reference as above, and next to v1 above it differs only in the rounding order
+    // (H's int8 codes may move by one)
+    {
         fused::native_v2_override(1);
         if (!fused::native_v2_ready()) {
             std::printf("  v2: does not run on this device - skipped\n");
@@ -474,7 +474,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     auto mmq_run = [&] { run_mmq(p, geo, ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s); };
     auto fused_run = [&] { run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, E}, blob, s); };
     fused::native_v2_override(0);   // the fused arm is the native kernels; v2 is forced on below
-    const bool all_routed = std::count(r.cnt.begin(), r.cnt.end(), 0) == 0;
+    const bool all_routed = p.up() == p.gu && std::count(r.cnt.begin(), r.cnt.end(), 0) == 0;
     auto direct_run = [&] {
         run_mmq(p, geo, ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s, true, stride);
     };
@@ -581,7 +581,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
             throw std::runtime_error(std::string(p.name) + ": the fused path's error is not comparable to MMQ's (timing)");
     }
     // v2 at the real shape: timed back to back, and against the fused kernels' outputs above
-    if (p.gu == GGML_TYPE_IQ3_XXS || p.d == GGML_TYPE_IQ4_NL) {
+    {
         fused::native_v2_override(1);
         if (fused::native_v2_ready()) {
             for (float spent = 0; spent < 300.0f;) spent += once(fused_run);
@@ -592,8 +592,11 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
             const std::vector<int32_t> slot2 = download_i(fb.slot, (size_t) rows);
             const Err e21 = compare(y_2, [&](size_t i) { return (int64_t) slot2[i]; }, y_f,
                                     [&](size_t i) { return (int64_t) slot[i]; }, (size_t) rows);
-            std::printf("  v2: median %.3f ms, min %.3f (fused back to back %.3f: %.2fx); v2 vs fused rel RMS %.3e "
-                        "worst row %.3e\n", t2[4], t2[0], tf2[4], tf2[4] / t2[4], e21.rms, e21.worst);
+            const double flops = 6.0 * (double) rows * (double) N * (double) FF;
+            std::printf("  v2: median %.3f ms (%.1f TFLOP/s), min %.3f (fused back to back %.3f: %.2fx, MMQ %.2fx); "
+                        "v2 vs fused rel RMS %.3e worst row %.3e\n",
+                        t2[4], flops / ((double) t2[4] * 1e9), t2[0], tf2[4], tf2[4] / t2[4], t_mmq / t2[4], e21.rms,
+                        e21.worst);
             fused::native_v2_override(0);
             if (e21.rms > 0.01)
                 throw std::runtime_error(std::string(p.name) + ": v2 and the fused kernels disagree (timing)");
@@ -617,7 +620,8 @@ int main(int argc, char** argv) {
             {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S / Q2_0"},       {GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, "IQ2_XXS / Q2_0"},
             {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, "IQ2_XS / IQ4_NL"}, {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, "IQ3_XXS / IQ4_NL"},
             {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, "IQ3_S / IQ4_NL"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0, "IQ4_XS / Q2_0"},
-            {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S+IQ2_XXS / Q2_0", GGML_TYPE_IQ2_XXS}};
+            {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S+IQ2_XXS / Q2_0", GGML_TYPE_IQ2_XXS},
+            {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, "IQ2_S / IQ4_NL"}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
@@ -644,8 +648,9 @@ int main(int argc, char** argv) {
             if (ref) reference_part(p, s);
         }
         if (timing) {
-            // the IQ2_XS pack's layers (34 of 48 IQ2_S / Q2_0, 11 IQ2_XXS / Q2_0), the IQ3_S pack's most common, IQ3_XXS's
-            for (const Pair& p : {pairs[0], pairs[1], pairs[4], pairs[3]}) {
+            const std::vector<Pair> tpairs =
+                only ? pairs : std::vector<Pair>{pairs[0], pairs[1], pairs[7], pairs[4], pairs[3]};
+            for (const Pair& p : tpairs) {
                 if (only && std::string(p.name).find(only) == std::string::npos) continue;
                 for (int T : chunks) timing_part(p, T, s);
             }

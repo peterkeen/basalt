@@ -1478,7 +1478,19 @@ if(BASALT_MODEL_QWEN4EXP)
 target_link_libraries(model_qwen4exp_prefill PUBLIC mmq peer_share)
 # the FP4 block-scaled tensor-core experts (need the a-variant of the architecture)
 # the fused prompt experts: on the MMQ device code, with its flags
-add_library(model_qwen4exp_moe_fused STATIC src/models/qwen4exp/prefill/moe_fused.cu src/models/qwen4exp/prefill/moe_fused_iq.cu)
+add_library(model_qwen4exp_moe_fused STATIC
+  src/models/qwen4exp/prefill/moe_fused.cu
+  src/models/qwen4exp/prefill/moe_fused_iq.cu
+  src/models/qwen4exp/prefill/moe_fused_v2_iq2xxs.cu
+  src/models/qwen4exp/prefill/moe_fused_v2_iq2xs.cu
+  src/models/qwen4exp/prefill/moe_fused_v2_iq2s.cu
+  src/models/qwen4exp/prefill/moe_fused_v2_iq3xxs.cu
+  src/models/qwen4exp/prefill/moe_fused_v2_iq3s.cu
+  src/models/qwen4exp/prefill/moe_fused_v2_iq4xs.cu
+  src/models/qwen4exp/prefill/moe_fused_v2_mix_iq2s_iq2xxs.cu
+  src/models/qwen4exp/prefill/moe_fused_v2_q2_0.cu
+  src/models/qwen4exp/prefill/moe_fused_v2_iq4nl.cu
+)
 target_include_directories(model_qwen4exp_moe_fused PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(model_qwen4exp_moe_fused PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
 target_link_libraries(model_qwen4exp_moe_fused PUBLIC mmq ${_gpu_runtime_target})
