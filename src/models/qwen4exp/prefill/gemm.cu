@@ -1,5 +1,6 @@
 // src/models/qwen4exp/prefill/gemm.cu - see include/basalt/models/qwen4exp/prefill/gemm.hpp.
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
+#include "gemm_wht128.hpp"
 #include "basalt/kernels/dequant_bf16.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 
@@ -175,8 +176,11 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
        "cublasGemmEx f16");
 }
 
+void Gemm::native_wht128_override(int mode) { gemm_wht128_set_override(mode); }
+
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta) {
+    if (gemm_wht128_native(X, ggml_type, W_blocks, Y, T, N, K, ldy, beta, scratch_, scratch_elems_, stream_)) return;
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;

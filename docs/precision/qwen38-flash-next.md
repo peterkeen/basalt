@@ -44,12 +44,13 @@ which experts sit where changes the last bits. Pin `--adapt-swaps 0 --peer-adapt
 
 ### Prefill
 
-Prefill is a different computation from decode: fp16 and BF16 GEMMs, int8 MMQ, and FP4 tensor cores for NVFP4 experts. The gate
-scores the decode path.
+Prefill is a different computation from decode: fp16, BF16 and WHT-128 int8 GEMMs, int8 MMQ and native fused int8 kernels, and FP4
+tensor cores for NVFP4 experts. The gate scores the decode path.
 
 | Path | Format | Rounding |
 |---|---|---|
-| Dense projections | fp16 weights and activations, cuBLAS, fp32 accumulate | fp16 activations |
+| Dense projections | native GGUF weights: randomized WHT-128 int8 tensor-core dot (fp32 accumulate) above the chunk threshold, fp16 cuBLAS below; BF16 weights: BF16 cuBLAS | WHT-128 int8 per 128 values (about 7.8e-3 relative) or fp16/BF16 activations |
+| Routed experts, native fused (streamed chunks of 6,144 or more) | int8 activations per 32 values, int8 mma decoded from GGUF blocks in place | rel RMS 1.45e-2 to 1.49e-2 against FP64 (matches MMQ) |
 | Routed experts, MMQ | q8_1 activations, int8 mma | int8 activation rounding (every MMQ format) |
 | Routed experts, FP4 tensor cores (NVFP4, chunks of 1,024 or more) | E2M1 activations with a UE4M3 scale per 16 values and one fp32 scale per token; `mma kind::mxf4nvf4` | W4A4; numerics change against MMQ |
 | Routed experts, CPU pool (chunks under 6,144 tokens) | ggml dot products, the same as decode's RAM tier | the CPU rounding above |
@@ -69,6 +70,7 @@ Measured prefill numbers (NVIDIA-checkpoint NVFP4 pack, 400 W + 180 W, T 3, int8
 | FP4 vs MMQ speed, 400 W + 180 W, cold | MMQ 17 to 19% slower: 16K 6,456 against 7,807 tok/s; 64K 8,201 against 10,126 tok/s |
 | CPU share 0 (all GPU) against 1 (all CPU), NVFP4 DQ6_K, 20 chunks | PPL 2.3046 / 2.3068, KLD 0.07337 / 0.07085, top-1 93.04% / 93.12%; paired +0.0025 [-0.0005, +0.0055] |
 | K-quant MMQ against the FP16 path | rel RMS 1.08e-2 against 5e-4 (MMQ carries int8 activation rounding); 100-chunk gate within run noise |
+| WHT-128 dense + native fused experts against FP16 dense + MMQ, IQ3_S, 180 W, tiers pinned | KLD mean 0.0005 (32 prompts of 2,049), 0.0004 (24 of 8,193) and 0.0003 (16 of 16,385); top-1 72 of 72 |
 
 ## Measured costs
 

@@ -109,7 +109,7 @@ target_include_directories(model_qwen4exp_engine PUBLIC ${CMAKE_CURRENT_SOURCE_D
 target_link_libraries(model_qwen4exp_engine PUBLIC core model tiers model_qwen4exp_kernels kernels_cpu ${_gpu_runtime_target})
 
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
-add_library(model_qwen4exp_prefill STATIC src/models/qwen4exp/prefill/gemm.cu src/models/qwen4exp/prefill/kernels.cu src/models/qwen4exp/prefill/gdn_chunked.cu
+add_library(model_qwen4exp_prefill STATIC src/models/qwen4exp/prefill/gemm.cu src/models/qwen4exp/prefill/gemm_wht128.cu src/models/qwen4exp/prefill/kernels.cu src/models/qwen4exp/prefill/gdn_chunked.cu
   src/models/qwen4exp/prefill/lifecycle.cpp
   src/models/qwen4exp/prefill/layout.cpp
   src/models/qwen4exp/prefill/projection.cpp

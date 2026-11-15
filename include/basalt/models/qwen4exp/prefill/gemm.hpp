@@ -47,9 +47,13 @@ public:
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
-    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
+    /// W given as native GGUF blocks of `ggml_type`, X in FP16: WHT-128 int8 tensor-core GEMM above the chunk
+    /// threshold, or FP16 dequantization in the scratch + cuBLAS below it.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f);
+
+    /// Tests: force `native()` onto WHT-128 int8 (1), FP16 cuBLAS (0), or automatic threshold (-1).
+    static void native_wht128_override(int mode);
 
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
