@@ -382,5 +382,166 @@ class TokenizerKvTest(unittest.TestCase):
                 C.tokenizer_kv(C.Checkpoint(d))
 
 
+def encode_csf(scales: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Reference CSF encoder for UE4M3 [rows, cols_sc] (rows % 16 == 0)."""
+    rows, cols_sc = scales.shape
+    bases = np.median(scales, axis=1).astype(np.int32)
+    diff = scales.astype(np.int32) - bases[:, None]
+    ok = (diff >= 0) & (diff <= 15)
+    nib = np.where(ok, diff, 0).astype(np.uint8)
+    exc_pos = np.flatnonzero(~ok.reshape(-1))
+    exc_val = scales.reshape(-1)[exc_pos].astype(np.uint32)
+    exc = (exc_pos.astype(np.uint32) | (exc_val << 24)).astype("<u4")
+    flat = nib.reshape(rows // 16, 16 * cols_sc)
+    packed = (flat[:, 0::2] | (flat[:, 1::2] << 4)).astype(np.uint8)
+    fixed = np.concatenate([bases.astype(np.uint8).reshape(rows // 16, 16), packed], axis=1)
+    return fixed, exc
+
+
+class CsfExpertTest(unittest.TestCase):
+    def test_csf_matches_raw_scales_and_checks_invariants(self):
+        import multiprocessing
+        rng = np.random.default_rng(11)
+        cfg = {"text_config": {"num_hidden_layers": 1, "num_experts": 1, "hidden_size": 128, "moe_intermediate_size": 64}}
+        with tempfile.TemporaryDirectory() as t_raw, tempfile.TemporaryDirectory() as t_csf:
+            d_raw, d_csf = Path(t_raw), Path(t_csf)
+            tens_raw, tens_csf = {}, {}
+            for i, (r, (rows, cols)) in enumerate({"gate_proj": (64, 128), "up_proj": (64, 128), "down_proj": (128, 64)}.items()):
+                p = f"model.language_model.layers.0.mlp.experts.0.{r}."
+                w = rng.integers(0, 256, size=(rows, cols // 2), dtype=np.uint8)
+                sc = rng.integers(40, 52, size=(rows, cols // 16), dtype=np.uint8)
+                sc[0, 0] = 0          # negative delta exception
+                sc[1, -1] = 0x7E      # >= 16 delta exception
+                fixed, exc = encode_csf(sc)
+                s2 = np.float32(0.25 + i).tobytes()
+                tens_raw[p + "weight"] = tens_csf[p + "weight"] = ("U8", w.shape, w.tobytes())
+                tens_raw[p + "weight_scale"] = ("F8_E4M3", sc.shape, sc.tobytes())
+                tens_csf[p + "weight_scale.nvfp4_csf_fixed"] = ("U8", fixed.shape, fixed.tobytes())
+                tens_csf[p + "weight_scale.nvfp4_csf_exceptions"] = ("U32", exc.shape, exc.tobytes())
+                tens_raw[p + "weight_scale_2"] = tens_csf[p + "weight_scale_2"] = ("F32", (), s2)
+            small_checkpoint(d_raw, tens_raw, cfg)
+            small_checkpoint(d_csf, tens_csf, cfg)
+            ex_raw = C.CheckpointExperts(C.Checkpoint(d_raw))
+            ex_csf = C.CheckpointExperts(C.Checkpoint(d_csf))
+            self.assertFalse(ex_raw.csf)
+            self.assertTrue(ex_csf.csf)
+            with multiprocessing.Pool(1) as pool:
+                self.assertEqual(b"".join(ex_csf.chunks(pool)), b"".join(ex_raw.chunks(pool)))
+
+            # Invariant failures: non-zero sentinel nibble, out-of-bounds index, duplicate index, NaN scale
+            fixed, exc = encode_csf(np.full((16, 4), 30, np.uint8))
+            exc_bad_oob = np.array([(64) | (10 << 24)], dtype="<u4")
+            self.assertIn("out of bounds", C.csf_scales(fixed, exc_bad_oob, 16, 4))
+            fixed_nz = fixed.copy()
+            fixed_nz[0, 16] = 1
+            self.assertIn("non-zero nibble", C.csf_scales(fixed_nz, np.array([0 | (10 << 24)], "<u4"), 16, 4))
+            self.assertIn("duplicate", C.csf_scales(fixed, np.array([0 | (10 << 24), 0 | (11 << 24)], "<u4"), 16, 4))
+            self.assertIn("NaN", C.csf_scales(fixed, np.array([0 | (0x7F << 24)], "<u4"), 16, 4))
+
+
+class Mxfp8AndPleNvfp4Test(unittest.TestCase):
+    def test_index_json_mxfp8_lossless_and_f32_norms(self):
+        import multiprocessing
+        import ggufq
+        rng = np.random.default_rng(19)
+        H = 256
+        L = "model.language_model.layers.0."
+        vals = {}
+
+        def mxfp8_pair(name, shape):
+            # Force exact BF16 compatibility by keeping scales in normal exponent range
+            codes = rng.integers(0, 0x7E, size=shape, dtype=np.uint8)
+            codes |= rng.integers(0, 2, size=shape, dtype=np.uint8) << 7
+            codes = np.where((codes & 0x7F) == 0x7F, 0x7E, codes).astype(np.uint8)
+            scales = rng.integers(120, 132, size=(shape[0], shape[1] // 32), dtype=np.uint8)
+            vals[name] = C.mxfp8_values(codes, scales)
+            return {name: ("F8_E4M3", shape, codes.tobytes()),
+                    name + "_scale": ("U8", scales.shape, scales.tobytes())}
+
+        norm_f32 = rng.standard_normal(H).astype(np.float32) * 0.1
+        tens = {
+            **mxfp8_pair(L + "linear_attn.in_proj_a.weight", (48, H)),
+            **mxfp8_pair(L + "linear_attn.in_proj_qkv.weight", (GDN, H)),
+            **mxfp8_pair(L + "linear_attn.in_proj_z.weight", (48 * 128, H)),
+            **mxfp8_pair(L + "linear_attn.out_proj.weight", (H, 48 * 128)),
+            **mxfp8_pair(L + "mlp.shared_expert.down_proj.weight", (H, 640)),
+            **mxfp8_pair(L + "self_attn.indexer.index_qk_proj.weight", (640, H)),
+            L + "attn_hyper_connection.hc_norm.weight": ("F32", (H,), norm_f32.tobytes()),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "tensors").mkdir()
+            rel = "tensors/model-00001-of-00001.safetensors"
+            write_safetensors(d / rel, tens)
+            (d / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: rel for k in tens}}))
+            (d / "config.json").write_text(json.dumps(GDN_CFG))
+
+            ck = C.Checkpoint(d)
+            dn = C.CheckpointDense(ck, q6k=True, require_complete=False, mxfp8=True)
+            self.assertEqual(dn.tensors["blk.0.attn_qkv.weight"].type_name, "MXFP8")
+            self.assertEqual(dn.tensors["blk.0.ssm_out.weight"].type_name, "MXFP8")
+            self.assertEqual(dn.tensors["blk.0.ffn_down_shexp.weight"].type_name, "MXFP8")
+            np.testing.assert_array_equal(dn.bytes("blk.0.hc_attn_norm.weight").view("<f4"), norm_f32 + np.float32(1))
+            np.testing.assert_array_equal(
+                S._bf16_to_f32(dn.bytes("blk.0.ssm_alpha.weight").view("<u2")).reshape(48, H),
+                vals[L + "linear_attn.in_proj_a.weight"][S.gdn_block_source()])
+            np.testing.assert_array_equal(
+                S._bf16_to_f32(dn.bytes("blk.0.indexer.q_proj.weight").view("<u2")).reshape(512, H),
+                vals[L + "self_attn.indexer.index_qk_proj.weight"][:512])
+
+            with multiprocessing.Pool(2) as pool:
+                for gg_n, ck_n, perm in (
+                    ("blk.0.attn_qkv.weight", L + "linear_attn.in_proj_qkv.weight", lambda x: x[S.gdn_index(GDN, 4096)]),
+                    ("blk.0.attn_gate.weight", L + "linear_attn.in_proj_z.weight", lambda x: x[S.gdn_index(6144, 0)]),
+                    ("blk.0.ssm_out.weight", L + "linear_attn.out_proj.weight", lambda x: x[:, S.gdn_index(6144, 0)]),
+                    ("blk.0.ffn_down_shexp.weight", L + "mlp.shared_expert.down_proj.weight", lambda x: x),
+                ):
+                    raw = np.frombuffer(b"".join(dn.chunks(gg_n, pool)), dtype=np.uint8)
+                    self.assertEqual(raw.size, dn.tensors[gg_n].expected_bytes())
+                    got = ggufq.dequantize(raw, ggufq.GGMLQuantizationType.MXFP8).astype(np.float32)
+                    want = perm(vals[ck_n]).reshape(-1)
+                    np.testing.assert_array_equal(got, want)
+
+            # Orphan _scale is refused
+            tens_bad = dict(tens)
+            tens_bad[L + "orphan.weight_scale"] = ("U8", (4, 8), bytes(32))
+            write_safetensors(d / rel, tens_bad)
+            (d / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: rel for k in tens_bad}}))
+            with self.assertRaisesRegex(S.ConvertError, "orphan"):
+                C.CheckpointDense(C.Checkpoint(d), require_complete=False)
+
+    def test_ple_nvfp4_repack_and_validation(self):
+        import multiprocessing
+        rng = np.random.default_rng(23)
+        stem = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+        s2 = np.float32(3.5e-5)
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "config.json").write_text(json.dumps(GDN_CFG))
+            t0, t1, want = {}, {}, []
+            for idx, dst in ((0, t0), (1, t1)):
+                w = rng.integers(0, 256, size=(5, 80), dtype=np.uint8)
+                sc = rng.integers(1, 0x7F, size=(5, 10), dtype=np.uint8)
+                dst[f"{stem}shard_{idx}.weight"] = ("U8", w.shape, w.tobytes())
+                dst[f"{stem}shard_{idx}.weight_scale"] = ("F8_E4M3", sc.shape, sc.tobytes())
+                want.append(modelopt_values(w, sc) * float(s2))
+            t1[f"{stem}weight_scale_2"] = ("F32", (1,), s2.tobytes())
+            write_safetensors(d / "model-00001-of-00002.safetensors", t0)
+            write_safetensors(d / "model-00002-of-00002.safetensors", t1)
+
+            ple = C.ple_source(C.Checkpoint(d))
+            self.assertEqual((ple.type_name, ple.type_id, ple.rows, ple.row_bytes), ("NVFP4_32", 47, 10, 90))
+            with multiprocessing.Pool(1) as pool:
+                raw = np.frombuffer(b"".join(ple.chunks(pool)), dtype=np.uint8).reshape(10, 5, 18)
+            got = np.empty((10, 5, 32), np.float64)
+            for s in range(2):
+                sc_f = np.vectorize(ue4m3)(raw[:, :, s]) * ple.scale
+                q = raw[:, :, 2 + 8 * s:10 + 8 * s]
+                for half, nib in ((0, q & 15), (8, q >> 4)):
+                    mag = np.array(E2M1, np.float64)[nib & 7] * np.where(nib & 8, -1.0, 1.0)
+                    got[:, :, 16 * s + half:16 * s + half + 8] = mag * sc_f[..., None]
+            np.testing.assert_array_equal(got.reshape(10, 160), np.concatenate(want, axis=0))
+
+
 if __name__ == "__main__":
     unittest.main()

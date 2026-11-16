@@ -570,8 +570,12 @@ class PleFp8:
     """The PLE n-gram table of a checkpoint that stores it as FP8 shards (`...ngram_embedding.shard_K.weight`) with one
     BF16 `...ngram_embedding.weight_scale`, as Q8_0 rows: values are code x scale, re-blocked per 32 values."""
 
+    type_name = "Q8_0"
+    type_id = 8
+
     def __init__(self, path, chunk_rows: int = 65536):
         self.path, self.chunk_rows = path, chunk_rows
+        self.files = {pathlib.Path(path)}
         head, base = read_safetensors_header(path)
         scales = [k for k in head if k.endswith("ngram_embedding.weight_scale")]
         if len(scales) != 1:
@@ -597,6 +601,11 @@ class PleFp8:
         self.row_bytes = PLE_DIM // 32 * 34
         self.nbytes = self.rows * self.row_bytes
 
+    def conversion_record(self) -> dict:
+        return {"name": "per_layer_token_embd.weight", "src_type": "F8_E4M3", "dst_type": "Q8_0",
+                "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)",
+                "scale": self.scale}
+
     def jobs(self):
         for off, rows in self.shards:
             for r in range(0, rows, self.chunk_rows):
@@ -606,6 +615,98 @@ class PleFp8:
     def chunks(self, pool, depth: int = 16):
         """The Q8_0 rows in order, made on `pool` with at most `depth` chunks in flight."""
         yield from bounded_imap(pool, _ple_job, self.jobs(), depth)
+
+
+NVFP4_32 = 47
+
+
+def nvfp4_32_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
+    """Model Optimizer's NVFP4 rows -> block_nvfp4_32 (32 values in 18 bytes: 2 UE4M3 scales then 16 code bytes
+    where sub-block s keeps value j in the low nibble of byte 8 s + j and value j + 8 in its high nibble)."""
+    rows, cols = codes.shape[0], codes.shape[1] * 2
+    v = np.empty((rows, cols), np.uint8)
+    v[:, 0::2] = codes & 15
+    v[:, 1::2] = codes >> 4
+    v = v.reshape(rows, cols // 32, 2, 16)
+    out = np.empty((rows, cols // 32, 18), np.uint8)
+    out[..., :2] = scales.reshape(rows, cols // 32, 2)
+    out[..., 2:] = (v[..., :8] | (v[..., 8:] << 4)).reshape(rows, cols // 32, 16)
+    return out.reshape(-1)
+
+
+def _ple_nvfp4_job(args):
+    wp, wo, sp, so, rows = args
+    w = np.fromfile(wp, dtype=np.uint8, count=rows * (PLE_DIM // 2), offset=wo).reshape(rows, PLE_DIM // 2)
+    sc = np.fromfile(sp, dtype=np.uint8, count=rows * (PLE_DIM // 16), offset=so).reshape(rows, PLE_DIM // 16)
+    if (sc & 0x80).any() or (sc == 0x7F).any():
+        return f"a PLE UE4M3 scale with the sign bit set or NaN at {pathlib.Path(sp).name}+{so}"
+    return nvfp4_32_rows(w, sc).tobytes()
+
+
+class PleNvfp4:
+    """The PLE n-gram table of a checkpoint that stores it as NVFP4 shards (`...shard_K.weight` U8 [rows, 80] and
+    `...shard_K.weight_scale` UE4M3 [rows, 10]) with one F32 `...ngram_embedding.weight_scale_2`, repacked into
+    NVFP4_32 rows (5 blocks of 18 bytes each, codes and UE4M3 scales unchanged)."""
+
+    type_name = "NVFP4_32"
+    type_id = NVFP4_32
+
+    def __init__(self, ck, chunk_rows: int = 262144):
+        self.chunk_rows = chunk_rows
+        scales2 = [k for k in ck.t if k.endswith("ngram_embedding.weight_scale_2")]
+        if len(scales2) != 1:
+            raise ConvertError(f"{ck.dir}: {len(scales2)} ngram_embedding.weight_scale_2 tensors")
+        s2_key = scales2[0]
+        stem = s2_key[:-len("weight_scale_2")]
+        _, _, dt, sh, _ = ck.t[s2_key]
+        if dt != "F32" or sh not in ([], [1]):
+            raise ConvertError(f"{s2_key}: expected one F32 value, got {dt} {sh}")
+        self.scale = float(ck.raw(s2_key).view("<f4")[0])
+        if not (np.isfinite(self.scale) and self.scale > 0):
+            raise ConvertError(f"{s2_key}: {self.scale} is not finite and positive")
+        shards, files = [], {ck.t[s2_key][0]}
+        while f"{stem}shard_{len(shards)}.weight" in ck.t:
+            wk = f"{stem}shard_{len(shards)}.weight"
+            sk = f"{stem}shard_{len(shards)}.weight_scale"
+            if sk not in ck.t:
+                raise ConvertError(f"the checkpoint has {wk} without {sk}")
+            wp, wo, wdt, wsh, _ = ck.t[wk]
+            sp, so, sdt, ssh, _ = ck.t[sk]
+            if wdt != "U8" or len(wsh) != 2 or wsh[1] != PLE_DIM // 2:
+                raise ConvertError(f"{wk} is {wdt} {wsh}, expected U8 [rows, {PLE_DIM // 2}]")
+            if sdt not in ("F8_E4M3", "U8") or ssh != [wsh[0], PLE_DIM // 16]:
+                raise ConvertError(f"{sk} is {sdt} {ssh}, expected F8_E4M3 [{wsh[0]}, {PLE_DIM // 16}]")
+            shards.append((wp, wo, sp, so, int(wsh[0])))
+            files.update((wp, sp))
+        if not shards:
+            raise ConvertError(f"{ck.dir}: no PLE shards under {stem}")
+        extra = [k for k in ck.t if k.startswith(stem + "shard_")
+                 and not any(k == f"{stem}shard_{i}.{s}" for i in range(len(shards)) for s in ("weight", "weight_scale"))]
+        if extra:
+            raise ConvertError(f"unexpected PLE shard tensor {extra[0]}")
+        self.shards = shards
+        self.files = files
+        self.rows = sum(r for *_, r in shards)
+        self.row_bytes = PLE_DIM // 32 * 18
+        self.nbytes = self.rows * self.row_bytes
+
+    def conversion_record(self) -> dict:
+        return {"name": "per_layer_token_embd.weight", "src_type": "NVFP4", "dst_type": "NVFP4_32",
+                "method": "codes and UE4M3 scales unchanged in 32-value blocks, weight_scale_2 in qwen4exp.ple.scale",
+                "exact": True, "scale": self.scale}
+
+    def jobs(self):
+        for wp, wo, sp, so, rows in self.shards:
+            for r in range(0, rows, self.chunk_rows):
+                n = min(self.chunk_rows, rows - r)
+                yield (str(wp), wo + r * (PLE_DIM // 2), str(sp), so + r * (PLE_DIM // 16), n)
+
+    def chunks(self, pool, depth: int = 16):
+        """The NVFP4_32 rows in order, made on `pool` with at most `depth` chunks in flight."""
+        for b in bounded_imap(pool, _ple_nvfp4_job, self.jobs(), depth):
+            if isinstance(b, str):
+                raise ConvertError(b)
+            yield b
 
 
 # ------------------------------------------------------------------ Q6_K requantization of the dense projections

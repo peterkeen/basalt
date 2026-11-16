@@ -30,7 +30,28 @@ UNUSED, NORMAL, CONTROL, USER_DEFINED = 5, 1, 3, 4
 QWEN35_HF_SPLIT = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
                    r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
 VALUES_PER_JOB = 1 << 22
-TYPE_ID = {"F32": 0, "F16": 1, "Q8_0": 8, "Q6_K": 14, "BF16": 30}
+TYPE_ID = {"F32": 0, "F16": 1, "Q8_0": 8, "Q6_K": 14, "BF16": 30, "MXFP8": 46}
+E4M3 = S.fp8_e4m3_table()
+
+
+def mxfp8_values(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
+    """E4M3 codes [rows, cols] times 2^(UE8M0 - 127) per 32-value block [rows, cols // 32], exact in float32."""
+    v = E4M3[codes]
+    if np.isnan(v).any() or (scales == 0xFF).any():
+        raise S.ConvertError("a NaN E4M3 weight or UE8M0 block scale")
+    s = np.ldexp(np.float32(1), scales.astype(np.int32) - 127).astype(np.float32)
+    return v * np.repeat(s, 32, axis=1)
+
+
+def mxfp8_blocks(codes: np.ndarray, scales: np.ndarray):
+    """E4M3 codes [rows, cols] and UE8M0 scales [rows, cols // 32] -> block_mxfp8 bytes (4 scales + 128 codes)."""
+    if ((codes & 0x7F) == 0x7F).any() or (scales == 0xFF).any():
+        return "a NaN E4M3 weight or UE8M0 scale"
+    rows, nb = codes.shape[0], codes.shape[1] // 128
+    out = np.empty((rows, nb, 132), np.uint8)
+    out[..., :4] = scales.reshape(rows, nb, 4)
+    out[..., 4:] = codes.reshape(rows, nb, 128)
+    return out.tobytes()
 
 
 class Checkpoint:
@@ -43,7 +64,19 @@ class Checkpoint:
             raise S.ConvertError(f"{cfg} not found")
         self.config = json.loads(cfg.read_text(encoding="utf-8"))
         self.text = self.config.get("text_config", self.config)
-        self.files = sorted(self.dir.glob("*.safetensors"))
+        idx = self.dir / "model.safetensors.index.json"
+        wm = None
+        if idx.is_file():
+            wm = json.loads(idx.read_text(encoding="utf-8")).get("weight_map") or {}
+            indexed = sorted({self.dir / rel for rel in wm.values()})
+            missing = [str(p) for p in indexed if not p.is_file()]
+            if missing:
+                raise S.ConvertError("missing checkpoint shards: " + ", ".join(missing[:4]))
+            extra = [p for p in sorted(self.dir.glob("*.safetensors")) if p not in set(indexed)]
+            self.files = indexed + extra
+        else:
+            sub = sorted((self.dir / "tensors").glob("*.safetensors")) if (self.dir / "tensors").is_dir() else []
+            self.files = sorted(self.dir.glob("*.safetensors")) + sub
         self.shards = [p for p in self.files if re.fullmatch(r"model-\d+-of-\d+\.safetensors", p.name)]
         if not self.shards:
             raise S.ConvertError(f"{self.dir}: no model-NNNNN-of-NNNNN.safetensors shards")
@@ -62,19 +95,26 @@ class Checkpoint:
                 elif not SKIP.match(k):
                     raise S.ConvertError(f"{p.name} is not a model-NNNNN-of-NNNNN shard and holds {k}, which would be "
                                          "dropped; only the n-gram table, drafter and vision tensors may live there")
+        if wm is not None:
+            bad = [k for k, rel in wm.items() if k not in self.t or self.t[k][0] != self.dir / rel]
+            if bad:
+                raise S.ConvertError(f"model.safetensors.index.json: {bad[0]} does not match the shard headers")
 
     def raw(self, name) -> np.ndarray:
         p, off, _, _, n = self.t[name]
         return np.fromfile(p, dtype=np.uint8, count=n, offset=off)
 
     def values(self, name) -> np.ndarray:
-        """A BF16, F32 or I64 tensor as float32 (int64 for I64), shaped."""
+        """A BF16, F32, F8_E4M3 (with `<name>_scale` UE8M0 per 32) or I64 tensor as float32 (int64 for I64), shaped."""
         p, off, dt, shape, n = self.t[name]
         raw = self.raw(name)
         if dt == "BF16":
             return S._bf16_to_f32(raw.view("<u2")).reshape(shape)
         if dt == "F32":
             return raw.view("<f4").reshape(shape)
+        if dt == "F8_E4M3":
+            sc = self.raw(name + "_scale").reshape(shape[0], shape[1] // 32)
+            return mxfp8_values(raw.reshape(shape), sc)
         if dt == "I64":
             return raw.view("<i8").reshape(shape)
         raise S.ConvertError(f"{name} is {dt}")
@@ -103,17 +143,50 @@ def nvfp4_rows(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
     return out.reshape(-1)
 
 
+def csf_scales(fixed: np.ndarray, exc: np.ndarray, rows: int, cols_sc: int):
+    """byte-window4-fixed-stream-u24-exceptions/1 -> UE4M3 [rows, cols_sc], or an error string."""
+    bases = fixed[:, :16].reshape(rows, 1).astype(np.int32)
+    packed = fixed[:, 16:]
+    nib = np.empty((fixed.shape[0], packed.shape[1] * 2), np.uint8)
+    nib[:, 0::2] = packed & 0x0F
+    nib[:, 1::2] = packed >> 4
+    nib = nib.reshape(rows, cols_sc)
+    sc = bases + nib.astype(np.int32)
+    if exc.size:
+        idx = (exc & 0x00FFFFFF).astype(np.int64)
+        val = (exc >> 24).astype(np.int32)
+        if (idx >= rows * cols_sc).any():
+            return "a CSF exception index out of bounds"
+        if idx.size > 1 and not ((idx[1:] > idx[:-1]).all() or np.unique(idx).size == idx.size):
+            return "duplicate CSF exception indices"
+        if (nib.reshape(-1)[idx] != 0).any():
+            return "a CSF exception at a non-zero nibble"
+        sc.reshape(-1)[idx] = val
+    if (sc < 0).any() or (sc >= 0x7F).any():
+        return "a CSF-decoded UE4M3 scale with the sign bit set or NaN"
+    return sc.astype(np.uint8)
+
+
 def _expert_job(args):
     """Blobs of experts [s, s + n) of one layer: [gate | up | down] blocks and the FP32 scale tail."""
     entries, n = args
     out = []
     for e in range(n):
         parts, tail = [], []
-        for (wp, wo, wshape), (sp, so, sshape), (tp, to) in entries[e]:
+        for (wp, wo, wshape), sc_ent, (tp, to) in entries[e]:
             w = np.fromfile(wp, dtype=np.uint8, count=wshape[0] * wshape[1], offset=wo).reshape(wshape)
-            sc = np.fromfile(sp, dtype=np.uint8, count=sshape[0] * sshape[1], offset=so).reshape(sshape)
-            if (sc & 0x80).any() or (sc == 0x7F).any():
-                return f"a UE4M3 scale with the sign bit set or NaN at {wp.name}+{wo}"
+            if len(sc_ent) == 3:
+                sp, so, sshape = sc_ent
+                sc = np.fromfile(sp, dtype=np.uint8, count=sshape[0] * sshape[1], offset=so).reshape(sshape)
+                if (sc & 0x80).any() or (sc == 0x7F).any():
+                    return f"a UE4M3 scale with the sign bit set or NaN at {wp.name}+{wo}"
+            else:
+                _, fp, fo, fshape, ep, eo, en, sshape = sc_ent
+                fixed = np.fromfile(fp, dtype=np.uint8, count=fshape[0] * fshape[1], offset=fo).reshape(fshape)
+                exc = np.fromfile(ep, dtype="<u4", count=en, offset=eo)
+                sc = csf_scales(fixed, exc, sshape[0], sshape[1])
+                if isinstance(sc, str):
+                    return f"{sc} at {fp.name}+{fo}"
             parts.append(nvfp4_rows(w, sc))
             tail.append(np.fromfile(tp, dtype="<f4", count=1, offset=to)[0])
         t = np.array(tail + [0.0], dtype="<f4")
@@ -139,12 +212,15 @@ class CheckpointExperts:
         h, ff = int(tc["hidden_size"]), int(tc["moe_intermediate_size"])
         shapes = {"gate_proj": (ff, h), "up_proj": (ff, h), "down_proj": (h, ff)}
         self.blob = 2 * ff * S.nvfp4_row_bytes(h) + h * S.nvfp4_row_bytes(ff) + S.NVFP4_TAIL
-        known = {f"{r}.{k}" for r in self.ROLES for k in ("weight", "weight_scale", "weight_scale_2", "input_scale")}
+        known = {f"{r}.{k}" for r in self.ROLES for k in (
+            "weight", "weight_scale", "weight_scale.nvfp4_csf_fixed",
+            "weight_scale.nvfp4_csf_exceptions", "weight_scale_2", "input_scale")}
         for k in ck.t:
             m = re.fullmatch(r"model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(.+)", k)
             if m and (int(m.group(1)) >= self.n_layers or int(m.group(2)) >= self.n_expert or m.group(3) not in known):
                 raise S.ConvertError(f"unexpected expert tensor {k} (the model has {self.n_layers} layers of "
                                      f"{self.n_expert} experts)")
+        self.csf = False
         self.entries = []
         for l in range(self.n_layers):
             layer = []
@@ -153,11 +229,30 @@ class CheckpointExperts:
                 for r in self.ROLES:
                     p = f"model.language_model.layers.{l}.mlp.experts.{e}.{r}."
                     rows, cols = shapes[r]
+                    cols_sc = cols // 16
                     ck.need(p + "weight", "U8", (rows, cols // 2))
-                    ck.need(p + "weight_scale", "F8_E4M3", (rows, cols // 16))
                     ck.need(p + "weight_scale_2", "F32", ())
-                    w, s, t = (ck.t[p + k] for k in ("weight", "weight_scale", "weight_scale_2"))
-                    ex.append(((w[0], w[1], w[3]), (s[0], s[1], s[3]), (t[0], t[1])))
+                    w, t = ck.t[p + "weight"], ck.t[p + "weight_scale_2"]
+                    has_raw = (p + "weight_scale") in ck.t
+                    has_csf = (p + "weight_scale.nvfp4_csf_fixed") in ck.t or (p + "weight_scale.nvfp4_csf_exceptions") in ck.t
+                    if has_raw and has_csf:
+                        raise S.ConvertError(f"{p}weight_scale has both raw and CSF scale tensors")
+                    if has_csf:
+                        if rows % 16:
+                            raise S.ConvertError(f"{p}weight_scale: {rows} rows is not a multiple of 16 for CSF")
+                        ck.need(p + "weight_scale.nvfp4_csf_fixed", "U8", (rows // 16, 16 + 8 * cols_sc))
+                        ck.need(p + "weight_scale.nvfp4_csf_exceptions", "U32")
+                        f = ck.t[p + "weight_scale.nvfp4_csf_fixed"]
+                        exc = ck.t[p + "weight_scale.nvfp4_csf_exceptions"]
+                        if len(exc[3]) != 1:
+                            raise S.ConvertError(f"{p}weight_scale.nvfp4_csf_exceptions has shape {exc[3]}, expected 1-D")
+                        sc_ent = ("csf", f[0], f[1], f[3], exc[0], exc[1], exc[3][0], [rows, cols_sc])
+                        self.csf = True
+                    else:
+                        ck.need(p + "weight_scale", "F8_E4M3", (rows, cols_sc))
+                        s = ck.t[p + "weight_scale"]
+                        sc_ent = (s[0], s[1], s[3])
+                    ex.append(((w[0], w[1], w[3]), sc_ent, (t[0], t[1])))
                 layer.append(ex)
             self.entries.append(layer)
         self.layout = [(l, NVFP4, NVFP4, l * self.blob * self.n_expert, self.blob) for l in range(self.n_layers)]
@@ -259,7 +354,8 @@ class Tensor:
 
     def expected_bytes(self) -> int:
         n = int(np.prod(self.ne))
-        return {"F32": 4 * n, "F16": 2 * n, "BF16": 2 * n, "Q8_0": n // 32 * 34, "Q6_K": n // 256 * 210}[self.type_name]
+        return {"F32": 4 * n, "F16": 2 * n, "BF16": 2 * n, "Q8_0": n // 32 * 34,
+                "Q6_K": n // 256 * 210, "MXFP8": n // 128 * 132}[self.type_name]
 
 
 def _index(how: str, n: int, first: int) -> np.ndarray | None:
@@ -277,9 +373,9 @@ class CheckpointDense:
     `bytes(name)` the stored bytes of a float tensor and `chunks(name, pool)` the streamed bytes of a quantized one.
     `where` and `bytes` are what model_sections.Dense reads."""
 
-    def __init__(self, ck: Checkpoint, q6k: bool = True, require_complete: bool = True):
+    def __init__(self, ck: Checkpoint, q6k: bool = True, require_complete: bool = True, mxfp8: bool = True):
         tc = ck.text
-        self.ck, self.q6k = ck, q6k
+        self.ck, self.q6k, self.mxfp8 = ck, q6k, mxfp8
         if int(tc["linear_num_key_heads"]) != S.GDN_K_HEADS or int(tc["linear_num_value_heads"]) != S.GDN_V_HEADS \
                 or int(tc["linear_key_head_dim"]) != S.GDN_HEAD or int(tc["linear_value_head_dim"]) != S.GDN_HEAD:
             raise S.ConvertError("the GDN head geometry differs from the GGUF head order this converter knows")
@@ -290,9 +386,20 @@ class CheckpointDense:
             _, _, dt, shape, _ = ck.t[k]
             if SKIP.match(k):
                 continue
+            if k.endswith("_scale"):
+                base = k[:-len("_scale")]
+                if base in ck.t and ck.t[base][2] == "F8_E4M3" and not SKIP.match(base):
+                    continue
+                unknown.append(k)
+                continue
             m = re.fullmatch(r"model\.language_model\.layers\.(\d+)\.(.+)", k)
             if m and m.group(2) == INDEXER_QK:
-                rows = shape[0] - self.qk_rows
+                if dt == "F8_E4M3":
+                    if len(shape) != 2 or shape[1] % 32:
+                        raise S.ConvertError(f"{k}: MXFP8 rows of {shape} are not a multiple of 32")
+                    ck.need(k + "_scale", "U8", (shape[0], shape[1] // 32))
+                elif dt != "BF16":
+                    raise S.ConvertError(f"{k} is {dt}; expected BF16 or F8_E4M3")
                 for nm, r in (("indexer.q_proj.weight", (0, self.qk_rows)), ("indexer.k_proj.weight", (self.qk_rows, shape[0]))):
                     self._add(f"blk.{m.group(1)}.{nm}", "BF16", k, "split", [shape[1], r[1] - r[0]], r)
                 continue
@@ -300,10 +407,16 @@ class CheckpointDense:
             if rule is None:
                 unknown.append(k)
                 continue
-            if dt != "BF16":
-                raise S.ConvertError(f"{k} is {dt}; the dense tensors are read from BF16")
             name = f"blk.{m.group(1)}.{rule[0]}" if m else rule[0]
             ty, how = rule[1], rule[2]
+            if dt == "F8_E4M3" and ty in ("BF16", "MAT"):
+                if len(shape) != 2 or shape[1] % 32:
+                    raise S.ConvertError(f"{k}: MXFP8 rows of {shape} are not a multiple of 32")
+                ck.need(k + "_scale", "U8", (shape[0], shape[1] // 32))
+            elif dt == "F32" and ty == "F32":
+                pass
+            elif dt != "BF16":
+                raise S.ConvertError(f"{k} is {dt}; the dense tensors are read from BF16, F32 norms or MXFP8")
             if how in ("conv", "gconv"):
                 if len(shape) != 3 or shape[1] != 1:
                     raise S.ConvertError(f"{k}: a conv weight of shape {shape}")
@@ -311,7 +424,12 @@ class CheckpointDense:
             else:
                 ne = list(reversed(shape))
             if ty == "MAT":
-                ty = "Q6_K" if q6k and ne[0] % S.Q6K_BLOCK == 0 else "Q8_0"
+                if dt == "F8_E4M3" and mxfp8:
+                    ty = "MXFP8"
+                else:
+                    ty = "Q6_K" if q6k and ne[0] % S.Q6K_BLOCK == 0 else "Q8_0"
+            if ty == "MXFP8" and (len(ne) != 2 or ne[0] % 128):
+                raise S.ConvertError(f"{k}: rows of {ne[0]} values cannot be MXFP8")
             if ty in ("Q8_0", "Q6_K") and (len(ne) != 2 or ne[0] % 32):
                 raise S.ConvertError(f"{k}: rows of {ne[0]} values cannot be {ty}")
             self._add(name, ty, k, how, ne)
@@ -394,12 +512,13 @@ class CheckpointDense:
 
     def jobs(self, name):
         t = self.tensors[name]
-        p, off, _, shape, _ = self.ck.t[t.src]
+        p, off, dt, shape, _ = self.ck.t[t.src]
+        sp, soff = self.ck.t[t.src + "_scale"][:2] if dt == "F8_E4M3" else (None, 0)
         ne0, ne1 = t.ne
         step = max(1, VALUES_PER_JOB // ne0)
         kind = {"vrows": "rows", "zrows": "rows", "vcols": "cols"}.get(t.how)
         for r in range(0, ne1, step):
-            yield (str(p), off, ne0, ne1, r, min(step, ne1 - r), kind,
+            yield (str(p), off, dt, str(sp) if sp else None, soff, ne0, ne1, r, min(step, ne1 - r), kind,
                    2 * S.GDN_K_HEADS * S.GDN_HEAD if t.how == "vrows" else 0, t.type_name)
 
     def chunks(self, name, pool, depth: int = 64):
@@ -410,8 +529,29 @@ class CheckpointDense:
 
 
 def _quant_job(args):
-    """Rows [row0, row0 + rows) of a BF16 matrix [ne1, ne0] (rows or columns in the GGUF order) as Q6_K or Q8_0."""
-    path, off, ne0, ne1, row0, rows, kind, first, ty = args
+    """Rows [row0, row0 + rows) of a BF16 or MXFP8 matrix [ne1, ne0] (in GGUF order) as MXFP8, Q6_K or Q8_0."""
+    path, off, dt, spath, soff, ne0, ne1, row0, rows, kind, first, ty = args
+    if dt == "F8_E4M3":
+        mw = np.memmap(path, dtype=np.uint8, mode="r", offset=off, shape=(ne1, ne0))
+        ms = np.memmap(spath, dtype=np.uint8, mode="r", offset=soff, shape=(ne1, ne0 // 32))
+        if kind == "rows":
+            idx = S.gdn_index(ne1, first)[row0:row0 + rows]
+            codes, scales = np.ascontiguousarray(mw[idx]), np.ascontiguousarray(ms[idx])
+        elif kind == "cols":
+            c_idx = S.gdn_index(ne0, 0)
+            s_idx = (S.gdn_block_source()[:, None] * (S.GDN_HEAD // 32) + np.arange(S.GDN_HEAD // 32)).reshape(-1)
+            codes = np.ascontiguousarray(mw[row0:row0 + rows][:, c_idx])
+            scales = np.ascontiguousarray(ms[row0:row0 + rows][:, s_idx])
+        else:
+            codes = np.ascontiguousarray(mw[row0:row0 + rows])
+            scales = np.ascontiguousarray(ms[row0:row0 + rows])
+        if ty == "MXFP8":
+            return mxfp8_blocks(codes, scales)
+        try:
+            x = mxfp8_values(codes, scales).reshape(-1)
+        except S.ConvertError as e:
+            return str(e)
+        return S.q6_k(x) if ty == "Q6_K" else S.q8_0(x)
     mm = np.memmap(path, dtype="<u2", mode="r", offset=off, shape=(ne1, ne0))
     if kind == "rows":
         u = mm[S.gdn_index(ne1, first)[row0:row0 + rows]]
@@ -605,3 +745,10 @@ def ple_table(ck: Checkpoint) -> pathlib.Path:
     if len(hits) != 1:
         raise S.ConvertError(f"{ck.dir}: {len(hits)} files hold an ngram_embedding.weight_scale")
     return hits[0]
+
+
+def ple_source(ck: Checkpoint):
+    """The checkpoint's PLE n-gram table reader: NVFP4_32 when `ngram_embedding.weight_scale_2` is present, else FP8->Q8_0."""
+    if any(k.endswith("ngram_embedding.weight_scale_2") for k in ck.t):
+        return S.PleNvfp4(ck)
+    return S.PleFp8(str(ple_table(ck)))

@@ -528,14 +528,15 @@ def warn_unofficial():
 
 def from_checkpoint(a) -> None:
     """The language model straight from an NVFP4 safetensors checkpoint (routed experts moved into Basalt's layout,
-    every other tensor converted once from BF16, the n-gram table from FP8, metadata and tokenizer from the
-    checkpoint's files); drafter and vision are copied from BASE byte for byte."""
+    MXFP8 projections and NVFP4 PLE rows kept in their native formats when present or converted once from BF16/FP8,
+    metadata and tokenizer from the checkpoint's files); drafter and vision are copied from BASE byte for byte."""
     import multiprocessing
     import checkpoint as C
     out, src = Path(a.out), Path(a.sections_from)
+    chat_from_base = getattr(a, "chat_template_from_base", False)
     if src.is_file() and json.loads(ModelFile(str(src)).read("meta")).get("arch") == "deepseek41":
-        if a.dense_q8_0 or a.mtp_dense:
-            die("a deepseek41 BASE takes no --dense-q8-0 or --mtp-dense")
+        if a.dense_q8_0 or a.mtp_dense or chat_from_base:
+            die("a deepseek41 BASE takes no --dense-q8-0, --mtp-dense or --chat-template-from-base")
         import checkpoint_deepseek41 as D
         D.build(a, Job, fingerprint, source_record)
         return
@@ -549,13 +550,20 @@ def from_checkpoint(a) -> None:
     base = ModelFile(str(src))
     base_meta = json.loads(base.read("meta"))
     q6k = not a.dense_q8_0
+    mxfp8 = not a.dense_q8_0
     try:
         ck = C.Checkpoint(a.checkpoint)
         experts = C.CheckpointExperts(ck)
-        dense_src = C.CheckpointDense(ck, q6k)
-        ple_path = C.ple_table(ck)
-        ple = S.PleFp8(str(ple_path))
-        kv = C.model_kv(ck, S.PLE_DIM, 18 if q6k else 7, a.name)
+        dense_src = C.CheckpointDense(ck, q6k, mxfp8=mxfp8)
+        ple = C.ple_source(ck)
+        has_q6k = any(t.type_name == "Q6_K" for t in dense_src.tensors.values())
+        kv = C.model_kv(ck, S.PLE_DIM, 18 if has_q6k else 7, a.name)
+        if ple.type_name == "NVFP4_32":
+            kv["qwen4exp.ple.scale"] = C.f32(ple.scale)
+        if chat_from_base:
+            if "tokenizer/chat_template.jinja" not in base.sections:
+                die(f"{src} has no tokenizer/chat_template.jinja section")
+            kv["tokenizer.chat_template"] = base.read("tokenizer/chat_template.jinja").decode("utf-8")
         dense = S.Dense(dense_src, False)
     except S.ConvertError as e:
         die(str(e))
@@ -586,7 +594,7 @@ def from_checkpoint(a) -> None:
             t = time.time()
             parts = []
             for n, info in dense_src.tensors.items():
-                if info.type_name in ("Q8_0", "Q6_K"):
+                if info.type_name in ("Q8_0", "Q6_K", "MXFP8"):
                     parts.append(Stream(info.expected_bytes(), dense_src.chunks(n, pool)))
                 else:
                     parts.append(dense_src.bytes(n).tobytes())
@@ -619,20 +627,18 @@ def from_checkpoint(a) -> None:
                     die(f"section {name}: the copy's SHA-256 differs from {src}'s")
             tens = {n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.ne],
                         "bytes": t.expected_bytes(), "offset": tensor_offsets[n]} for n, t in dense_src.tensors.items()}
-            tens["per_layer_token_embd.weight"] = {"type": "Q8_0", "type_id": 8, "shape": [S.PLE_DIM, ple.rows],
+            tens["per_layer_token_embd.weight"] = {"type": ple.type_name, "type_id": ple.type_id, "shape": [S.PLE_DIM, ple.rows],
                                                   "bytes": ple.nbytes, "offset": tensor_offsets["per_layer_token_embd.weight"]}
-            ck_files = sorted(set(ck.shards) | {ple_path})
+            ck_files = sorted(set(ck.shards) | ple.files)
             meta = {
                 "format": "basalt", "version": 2, "name": a.name or base_meta.get("name"),
                 "converter": {"tool": "tools/convert/convert.py"},
-                "sources": [{"path": p.name, "size": p.stat().st_size,
+                "sources": [{"path": p.relative_to(ck.dir).as_posix() if p.is_relative_to(ck.dir) else p.name,
+                             "size": p.stat().st_size,
                              "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)} for p in ck_files],
                 "gguf_kv": kv,
                 "tensors": tens,
-                "conversions": {"compat_bf16": False, "tensors": [{
-                    "name": "per_layer_token_embd.weight", "src_type": "F8_E4M3", "dst_type": "Q8_0",
-                    "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)",
-                    "scale": ple.scale}]},
+                "conversions": {"compat_bf16": False, "tensors": [ple.conversion_record()]},
                 "license": model_license(kv),
             }
             for k in ("mtp", "vision"):
@@ -640,18 +646,30 @@ def from_checkpoint(a) -> None:
             if tuned_sha:
                 meta["mtp"] = {**meta["mtp"], "dense": {"tuning": "self_distilled", "sha256": tuned_sha}}
             used = sorted({t.how for t in dense_src.tensors.values()})
+            has_mxfp8 = any(t.type_name == "MXFP8" for t in dense_src.tensors.values())
+            dense_desc = {
+                "projections": ("MXFP8 (E4M3 codes and UE8M0 scales per 32 unchanged, Q8_0 head/embed)" if has_mxfp8
+                                else "Q6_K where rows are whole 256-value blocks, else Q8_0" if q6k else "Q8_0"),
+                "q8_0_method": "ggml reference rounding",
+                "from": "MXFP8 projections, BF16 head/embed, F32/BF16 norms" if has_mxfp8 else "BF16, quantized once",
+                "transforms": {k: C.METHODS[k] for k in used},
+            }
+            if has_q6k:
+                dense_desc["q6_k_method"] = "least-squares 16-value group scales, 8-bit group scales, fp16 super-scale"
+            exp_src = ("weight (E2M1 pairs), weight_scale.nvfp4_csf_{fixed,exceptions} (lossless CSF UE4M3 per 16), "
+                       "weight_scale_2 (FP32); input_scale unused" if experts.csf else
+                       "weight (E2M1 pairs), weight_scale (UE4M3 per 16), weight_scale_2 (FP32); input_scale unused")
+            copied = [n for n in base.names() if n.startswith(("mtp/", "vision/"))]
+            if chat_from_base:
+                copied.append("tokenizer/chat_template.jinja")
             meta["checkpoint"] = {
                 "dir": Path(a.checkpoint).name, "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
-                "experts": {"format": "nvfp4", "source": "weight (E2M1 pairs), weight_scale (UE4M3 per 16), "
-                            "weight_scale_2 (FP32); input_scale unused", "repack": "codes and scales unchanged, "
+                "experts": {"format": "nvfp4", "source": exp_src, "repack": "codes and scales unchanged, "
                             "nibbles moved into 64-value blocks", "tail": "fp32 {s_gate, s_up, s_down, 0} per expert"},
-                "dense": {"projections": "Q6_K where rows are whole 256-value blocks, else Q8_0" if q6k else "Q8_0",
-                          "q6_k_method": "least-squares 16-value group scales, 8-bit group scales, fp16 super-scale",
-                          "q8_0_method": "ggml reference rounding", "from": "BF16, quantized once",
-                          "transforms": {k: C.METHODS[k] for k in used}},
+                "dense": dense_desc,
                 "sections_from": {"path": src.name, "size": src.stat().st_size,
                                   "fingerprint_sha256_first_last_64mib_and_size": fingerprint(src),
-                                  "copied": [n for n in base.names() if n.startswith(("mtp/", "vision/"))]}}
+                                  "copied": copied}}
             job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         w.close()
         ok = True
@@ -772,7 +790,9 @@ def main():
                     help="an NVFP4 safetensors checkpoint: with --sections-from, the language model is read from it; "
                          "with --requant-dense-q6k, the BF16 projections")
     ap.add_argument("--dense-q8-0", action="store_true",
-                    help="with --checkpoint and --sections-from: Q8_0 projections instead of Q6_K")
+                    help="with --checkpoint and --sections-from: Q8_0 projections instead of MXFP8/Q6_K")
+    ap.add_argument("--chat-template-from-base", action="store_true",
+                    help="with --checkpoint and --sections-from: keep the base pack's chat template")
     ap.add_argument("--stream-shards", action="store_true",
                     help="with --checkpoint and a deepseek41 --sections-from: shards arrive in file order and are deleted once used")
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
@@ -790,22 +810,22 @@ def main():
     if a.dspark and (a.checkpoint or a.requant_dense_q6k or a.sections_from):
         ap.error("--dspark goes with --gguf")
     if a.requant_dense_q6k:
-        if a.sections_from or a.gguf or a.dense_q8_0:
+        if a.sections_from or a.gguf or a.dense_q8_0 or a.chat_template_from_base:
             ap.error("--requant-dense-q6k takes only --checkpoint, --out, --workers and --force")
         requant_dense(a)
         return
     if a.sections_from and a.checkpoint:
         if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab:
             ap.error("--checkpoint with --sections-from takes only --out, --name, --mtp-dense, --dense-q8-0, "
-                     "--stream-shards, --workers and --force")
+                     "--chat-template-from-base, --stream-shards, --workers and --force")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
         if a.mtp_dense and not Path(a.mtp_dense).is_file():
             ap.error(f"missing input: {a.mtp_dense}")
         from_checkpoint(a)
         return
-    if a.dense_q8_0 or a.stream_shards:
-        ap.error("--dense-q8-0 and --stream-shards need --checkpoint and --sections-from")
+    if a.dense_q8_0 or a.chat_template_from_base or a.stream_shards:
+        ap.error("--dense-q8-0, --chat-template-from-base and --stream-shards need --checkpoint and --sections-from")
     if not a.gguf:
         ap.error("--gguf is required")
     if not Path(a.gguf[0]).is_file():
