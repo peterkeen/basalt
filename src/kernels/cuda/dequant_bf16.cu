@@ -39,6 +39,23 @@ __device__ __forceinline__ void scale_min_k4(int j, const uint8_t* q, int& d, in
     else { d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
 }
 
+__device__ __forceinline__ float mxfp8_ue8m0_f32(uint8_t x) {
+    const uint32_t bits = (x == 0) ? 0x00400000u : (x == 0xFF) ? 0x7fc00000u : ((uint32_t) x << 23);
+    return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ float mxfp8_e4m3_f32(uint8_t x) {
+    const uint32_t sign = (uint32_t) (x & 0x80u) << 24;
+    const uint32_t u = x & 0x7Fu;
+    if (u == 0x7Fu) return __uint_as_float(0x7fc00000u);
+    const uint32_t e = u >> 3, m = u & 7u;
+    if (e == 0) {
+        if (m == 0) return __uint_as_float(sign);
+        return __uint_as_float(__float_as_uint((float) m * (1.0f / 512.0f)) | sign);
+    }
+    return __uint_as_float(sign | ((e + 120u) << 23) | (m << 20));
+}
+
 // One 32-element group `g` (row-major over the whole slice); `out` points at that group's 32 outputs.
 template <int TYPE, typename T>
 __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row, T* out) {
@@ -163,6 +180,13 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
             put(out, j, dl * (float) kv_iq4nl[qs[j] & 0xf]);
             put(out, j + 16, dl * (float) kv_iq4nl[qs[j] >> 4]);
         }
+    } else if constexpr (TYPE == 46) {                             // MXFP8: e[4] UE8M0, qs[128] E4M3
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 4) * 132;
+        const int sb = gi_in_row % 4;
+        const float d = mxfp8_ue8m0_f32(b[sb]);
+        const uint8_t* qs = b + 4 + 32 * sb;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) put(out, j, mxfp8_e4m3_f32(qs[j]) * d);
     }
 }
 
@@ -201,6 +225,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     case 14: block_elems = 256; block_bytes = 210; return true;
     case 23: block_elems = 256; block_bytes = 136; return true;
     case 42: block_elems = 64; block_bytes = 18; return true;
+    case 46: block_elems = 128; block_bytes = 132; return true;
     default: return false;
     }
 }
@@ -234,6 +259,7 @@ const bool vec = (reinterpret_cast<uintptr_t>(out) & 15) == 0;
     case 20: DEQUANT_CASE(20);
     case 23: DEQUANT_CASE(23);
     case 42: DEQUANT_CASE(42);
+    case 46: DEQUANT_CASE(46);
     }
 #undef DEQUANT_CASE
     const cudaError_t e = cudaGetLastError();

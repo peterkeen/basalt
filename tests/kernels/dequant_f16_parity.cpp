@@ -28,6 +28,7 @@ void cpu_q8_0(const uint8_t* b, float* o) { basalt::dequantize_q8_0(b, o); }
 void cpu_iq4_xs(const uint8_t* b, float* o) { basalt::dequantize_iq4_xs(b, o); }
 void cpu_q5_k(const uint8_t* b, float* o) { basalt::dequantize_q5_K(b, o); }
 void cpu_q6_k(const uint8_t* b, float* o) { basalt::dequantize_q6_K(b, o); }
+void cpu_mxfp8(const uint8_t* b, float* o) { basalt::dequantize_mxfp8(b, o); }
 
 }  // namespace
 
@@ -35,7 +36,8 @@ int main(int argc, char** argv) {
     const int64_t rows = argc > 1 ? std::atoll(argv[1]) : 10240, cols = argc > 2 ? std::atoll(argv[2]) : 2560;
     const int iters = argc > 3 ? std::atoi(argv[3]) : 50;
     const Ty tys[] = {{23, 256, 136, "IQ4_XS", cpu_iq4_xs}, {8, 32, 34, "Q8_0", cpu_q8_0},
-                      {13, 256, 176, "Q5_K", cpu_q5_k}, {14, 256, 210, "Q6_K", cpu_q6_k}};
+                      {13, 256, 176, "Q5_K", cpu_q5_k}, {14, 256, 210, "Q6_K", cpu_q6_k},
+                      {46, 128, 132, "MXFP8", cpu_mxfp8}};
     int fails = 0;
     std::mt19937 rng(7);
     for (const Ty& t : tys) {
@@ -45,6 +47,11 @@ int main(int argc, char** argv) {
         // a normal scale in every block (random bytes make NaN/inf scales that the comparison cannot order)
         for (int64_t b = 0; b < rows * cols / t.be; ++b) {
             uint8_t* p = blk.data() + (size_t) b * t.bb;
+            if (t.type == 46) {
+                for (int s = 0; s < 4; ++s) p[s] = (uint8_t) (117 + (rng() % 7));
+                for (int j = 0; j < 128; ++j) if ((p[4 + j] & 0x7Fu) == 0x7Fu) p[4 + j] ^= 1u;
+                continue;
+            }
             const int off = (t.type == 14) ? 208 : 0;
             const __half h = __float2half(0.001f + (float) (rng() % 1000) * 1e-4f);
             std::memcpy(p + off, &h, 2);

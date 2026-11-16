@@ -37,7 +37,7 @@ struct Case {
 };
 const Case CASES[] = {
     {"Q6_K", 14, 210, {208, -1}}, {"Q8_0", 8, 34, {0, -1}},   {"Q4_K", 12, 144, {0, 2}}, {"Q5_K", 13, 176, {0, 2}},
-    {"IQ4_XS", 23, 136, {0, -1}}, {"Q3_K", 11, 110, {108, -1}}, {"Q2_0", 42, 18, {0, -1}},
+    {"IQ4_XS", 23, 136, {0, -1}}, {"Q3_K", 11, 110, {108, -1}}, {"Q2_0", 42, 18, {0, -1}}, {"MXFP8", 46, 132, {-1, -1}},
 };
 constexpr int NIN = 2560, NOUT = 24 * 512, TM = 8;
 
@@ -60,12 +60,19 @@ int run_case(const Case& c, cudaStream_t s, bool bench) {
     const std::size_t wbytes = k::native_mmvq_weight_bytes(c.type, NIN, NOUT);
     std::vector<uint8_t> w(wbytes);
     for (auto& b : w) b = (uint8_t) (rng() & 0xff);
-    for (std::size_t q = 0; q < wbytes / (std::size_t) c.block_bytes; ++q)
+    for (std::size_t q = 0; q < wbytes / (std::size_t) c.block_bytes; ++q) {
+        if (c.type == 46) {
+            uint8_t* p = &w[q * (std::size_t) c.block_bytes];
+            for (int sb = 0; sb < 4; ++sb) p[sb] = (uint8_t) (117 + (rng() % 6));
+            for (int j = 0; j < 128; ++j) if ((p[4 + j] & 0x7Fu) == 0x7Fu) p[4 + j] ^= 1u;
+            continue;
+        }
         for (int at : c.scale_at)
             if (at >= 0) {
                 const uint16_t h = sane_half(rng);
                 std::memcpy(&w[q * (std::size_t) c.block_bytes + (std::size_t) at], &h, 2);
             }
+    }
     std::vector<float> x((std::size_t) TM * NIN);
     std::normal_distribution<float> nd(0.f, 1.f);
     for (auto& v : x) v = nd(rng);

@@ -146,6 +146,7 @@ int sb_of(int type) {
         case 23: return Fmt<23>::SB;
         case 11: return Fmt<11>::SB;
         case 42: return Fmt<42>::SB;
+        case 46: return Fmt<46>::SB;
         default: return 0;
     }
 }
@@ -204,6 +205,7 @@ void qsa_qproj_half(int type, const void* w, const void* x, float* y, int n_in, 
         case 14: launch_half<14>(w, x, y, n_in, n_out, ncols, half, blocks, s); break;
         case 23: launch_half<23>(w, x, y, n_in, n_out, ncols, half, blocks, s); break;
         case 11: launch_half<11>(w, x, y, n_in, n_out, ncols, half, blocks, s); break;
+        case 46: launch_half<46>(w, x, y, n_in, n_out, ncols, half, blocks, s); break;
         default: launch_half<42>(w, x, y, n_in, n_out, ncols, half, blocks, s); break;
     }
     const cudaError_t e = cudaGetLastError();

@@ -67,7 +67,7 @@ std::vector<float> randn(size_t n, float sd, std::mt19937& r) {
     for (auto& x : v) x = nd(r);
     return v;
 }
-int sb_bytes(int type) { return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 ? 110 : type == 8 ? 272 : 136; }
+int sb_bytes(int type) { return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 ? 110 : type == 8 ? 272 : type == 46 ? 264 : 136; }
 // random super-blocks of a type with finite scales (d, and dmin for Q4_K / Q5_K; Q6_K's d is its last 2 bytes)
 std::vector<uint8_t> rand_type_host(int type, size_t nb, std::mt19937& r) {
     const int sb = sb_bytes(type);
@@ -76,10 +76,32 @@ std::vector<uint8_t> rand_type_host(int type, size_t nb, std::mt19937& r) {
     for (size_t k = 0; k < nb; ++k) {
         const uint16_t h = sane_half(r), h2 = sane_half(r);
         if (type == 8) { for (int j = 0; j < 8; ++j) { const uint16_t hj = sane_half(r); std::memcpy(&w[k * sb + 34 * j], &hj, 2); } }   // eight Q8_0 blocks
+        else if (type == 46) {
+            for (int b = 0; b < 2; ++b) {
+                uint8_t* p = &w[k * sb + 132 * b];
+                for (int s = 0; s < 4; ++s) p[s] = (uint8_t) (117 + (r() % 6));
+                for (int j = 0; j < 128; ++j) if ((p[4 + j] & 0x7Fu) == 0x7Fu) p[4 + j] ^= 1u;
+            }
+        }
         else if (type == 14) std::memcpy(&w[k * sb + 208], &h, 2);
         else { std::memcpy(&w[k * sb], &h, 2); if (type == 12 || type == 13) std::memcpy(&w[k * sb + 2], &h2, 2); }
     }
     return w;
+}
+void deq_mxfp8(const uint8_t* b, float* y) {
+    for (int blk = 0; blk < 2; ++blk) {
+        const uint8_t* p = b + 132 * blk;
+        for (int s = 0; s < 4; ++s) {
+            const float d = std::ldexp(1.0f, (int) p[s] - 127);
+            for (int i = 0; i < 32; ++i) {
+                const uint8_t q = p[4 + 32 * s + i];
+                const float sg = (q & 0x80u) ? -1.0f : 1.0f;
+                const int e = (q >> 3) & 0xF, m = q & 7;
+                const float v = e == 0 ? sg * std::ldexp((float) m, -9) : sg * std::ldexp((float) (8 + m), e - 10);
+                y[128 * blk + 32 * s + i] = v * d;
+            }
+        }
+    }
 }
 // one Q8_0 super-block (eight blocks of a half scale and 32 values)'s 256 values
 void deq_q80(const uint8_t* b, float* y) {
@@ -319,7 +341,7 @@ int main(int argc, char** argv) {
     }
 
     // the pair ring alternates its tiles between two groups: its slot count is even for every type triple
-    for (int q : {8, 12, 13, 14, 21, 23}) for (int z : {8, 12, 13, 14, 21, 23}) for (int o : {8, 12, 13, 14, 21, 23}) {
+    for (int q : {8, 12, 13, 14, 21, 23, 46}) for (int z : {8, 12, 13, 14, 21, 23, 46}) for (int o : {8, 12, 13, 14, 21, 23, 46}) {
         const int ns = K::mid_chain_ring_slots(q, z, o);
         if (ns < 2 || (ns & 1)) { std::printf("types %d/%d/%d: ring of %d slots\n", q, z, o, ns); ++bad; }
     }
@@ -328,9 +350,9 @@ int main(int argc, char** argv) {
     const std::vector<std::array<int, 3>> triples = {{14, 14, 14}, {23, 21, 12}, {14, 12, 14}, {13, 14, 14}, {12, 12, 14}, {14, 21, 23},
                                                      {23, 23, 14}, {13, 13, 13}, {12, 21, 21}, {14, 23, 12}, {23, 14, 13}, {13, 23, 14},
                                                      {13, 12, 14}, {13, 13, 14}, {13, 14, 13}, {14, 12, 12}, {14, 13, 12}, {14, 13, 14}, {14, 14, 13}, {14, 23, 13}, {14, 23, 14}, {23, 14, 14},
-                                                     {21, 21, 21}, {8, 8, 8}};
+                                                     {21, 21, 21}, {8, 8, 8}, {46, 46, 46}};
     std::vector<Layer> layers;
-    for (const auto& t : triples) layers.push_back(make_layer(t[0], t[1], t[2], (t[0] == 14 && t[1] == 14 && t[2] == 14) || (t[0] == 8 && t[1] == 8 && t[2] == 8)));
+    for (const auto& t : triples) layers.push_back(make_layer(t[0], t[1], t[2], (t[0] == 14 && t[1] == 14 && t[2] == 14) || (t[0] == 8 && t[1] == 8 && t[2] == 8) || (t[0] == 46 && t[1] == 46 && t[2] == 46)));
     // the device's grid with every triple; then smaller grids (the fewer-SM devices' split: tiles round-robin, several rec
     // heads and out tiles per CTA) with a few triples
     for (const int gr : {0, 120, 84, 70, 48, 36, 20, 16}) for (size_t l = 0; l < layers.size(); ++l) {
@@ -383,11 +405,11 @@ int main(int argc, char** argv) {
     }
 
     grid = 0;
-    // the projections against a double-precision CPU reference (Q6_K, then the Q8_0 triple), from the q8_1 rows the kernels read
-    for (const size_t li : {(size_t) 0, layers.size() - 1}) for (const int T : {3, TM}) {
+    // the projections against a double-precision CPU reference (Q6_K, Q8_0 and MXFP8 triples), from the q8_1 rows the kernels read
+    for (const size_t li : {(size_t) 0, layers.size() - 2, layers.size() - 1}) for (const int T : {3, TM}) {
         const Layer& w = layers[li];
-        const bool q8 = w.tq == 8;
-        const int sbb = q8 ? 272 : 210;
+        const bool q8 = w.tq == 8, mx = w.tq == 46;
+        const int sbb = q8 ? 272 : mx ? 264 : 210;
         reset(); run(w, T, true, true, s); CK(cudaStreamSynchronize(s));
         std::vector<uint8_t> xq((size_t) T * (N / 32) * 36);
         CK(cudaMemcpy(xq.data(), b.xq1, 0, cudaMemcpyDeviceToHost));   // (rows are overwritten by the recurrence's output: rebuild below)
@@ -406,7 +428,7 @@ int main(int argc, char** argv) {
             y.assign(rows, 0.0);
             std::vector<float> row(nin);
             for (int r = 0; r < rows; ++r) {
-                for (int k = 0; k < nin / 256; ++k) { const uint8_t* sbp = &wt[((size_t) r * (nin / 256) + k) * sbb]; if (q8) deq_q80(sbp, &row[k * 256]); else deq_q6k(sbp, &row[k * 256]); }
+                for (int k = 0; k < nin / 256; ++k) { const uint8_t* sbp = &wt[((size_t) r * (nin / 256) + k) * sbb]; if (q8) deq_q80(sbp, &row[k * 256]); else if (mx) deq_mxfp8(sbp, &row[k * 256]); else deq_q6k(sbp, &row[k * 256]); }
                 double a = 0; for (int i = 0; i < nin; ++i) a += (double) row[i] * x[i];
                 y[r] = a;
             }
@@ -428,7 +450,7 @@ int main(int argc, char** argv) {
             proj(w.ho, 2560, NO_IN, yq, t, y);
             for (int r = 0; r < 2560; ++r) { e_o = std::max(e_o, std::fabs(y[r] - bo[(size_t) t * N + r])); n_o = std::max(n_o, std::fabs(y[r])); }
         }
-        std::printf("CPU double reference (%s, T=%d, vs the q8_1 rows the kernel reads): max abs error qkv %.3g (max |y| %.3g), z %.3g (%.3g), out %.3g (%.3g)\n", q8 ? "Q8_0" : "Q6_K", T, e_q, n_q, e_z, n_z, e_o, n_o);
+        std::printf("CPU double reference (%s, T=%d, vs the q8_1 rows the kernel reads): max abs error qkv %.3g (max |y| %.3g), z %.3g (%.3g), out %.3g (%.3g)\n", q8 ? "Q8_0" : mx ? "MXFP8" : "Q6_K", T, e_q, n_q, e_z, n_z, e_o, n_o);
         if (e_q > 1e-3 * n_q || e_z > 1e-3 * n_z || e_o > 1e-3 * n_o) { std::printf("CPU reference: too far\n"); ++bad; }
     }
 

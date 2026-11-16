@@ -37,9 +37,9 @@ __host__ __device__ constexpr Geo make_geo(int tq, int tz, int to, int rc) {
     // and one group's mbarrier wait for the slot's second use would pass before the first use's data arrived
     if (g.ns & 1) --g.ns;
     g.orow = (O_NIN / 256) * sb_bytes(to);
-    // Q8_0 rows (6528 bytes) do not fit 16 to a tile: the first O_Q8_SMEM_CH chunks go to smem, the rest is prefetched to
-    // L2 and read from there
-    g.orb = to == 8 ? O_Q8_SMEM_CH * 2 * sb_bytes(8) : g.orow; g.ors = one_row_stride(g.orb);
+    // Q8_0 / MXFP8 rows (6528 / 6336 bytes) do not fit 16 to a tile: the first O_Q8_SMEM_CH chunks go to smem, the rest
+    // is prefetched to L2 and read from there
+    g.orb = (to == 8 || to == 46) ? O_Q8_SMEM_CH * 2 * sb_bytes(to) : g.orow; g.ors = one_row_stride(g.orb);
     g.ored = (16 * g.ors + 127) & ~127; g.ox = g.ored + o_redb(rc);
     return g;
 }
@@ -109,7 +109,9 @@ struct RecS {   // rec_rank's RecSmem with q/k/v for RXT tokens at a time, the a
 constexpr int OFF_REC = (OFF_PERM - (int) sizeof(RecS)) & ~127;
 static_assert(OFF_REC >= 16 * 5040, "rec above the largest out tile (Q6_K)");
 static_assert(OFF_REC >= 16 * one_row_stride(O_Q8_SMEM_CH * 2 * 272), "rec above the Q8_0 out tile");
-static_assert(make_geo(14, 14, 14, 8).ox <= OFF_PERM && make_geo(8, 8, 8, 8).ox <= OFF_PERM, "8-column red below the tail");
+static_assert(OFF_REC >= 16 * one_row_stride(O_Q8_SMEM_CH * 2 * 264), "rec above the MXFP8 out tile");
+static_assert(make_geo(14, 14, 14, 8).ox <= OFF_PERM && make_geo(8, 8, 8, 8).ox <= OFF_PERM &&
+              make_geo(46, 46, 46, 8).ox <= OFF_PERM, "8-column red below the tail");
 
 extern __shared__ __align__(128) char sm_dyn[];
 // weight copies: L2 evict-first policy (read once per layer; keeps the kernel's code and the activations in L2)

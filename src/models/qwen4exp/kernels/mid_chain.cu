@@ -149,7 +149,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
         STP(true, ST_OUT_REQ0);
         mbar_expect_tx(&P.ofull, 16 * P.geo.orb);
         for (int r = 0; r < 16; ++r) bulk_w2s(sm + r * P.geo.ors, P.lwo + (size_t) (ot * 16 + r) * P.geo.orow, P.geo.orb, &P.ofull);
-        if constexpr (FO == 8) for (int r = 0; r < 16; ++r) pf_l2(P.lwo + (size_t) (ot * 16 + r) * P.geo.orow + P.geo.orb, P.geo.orow - P.geo.orb);   // the row tails
+        if constexpr (FO == 8 || FO == 46) for (int r = 0; r < 16; ++r) pf_l2(P.lwo + (size_t) (ot * 16 + r) * P.geo.orow + P.geo.orb, P.geo.orow - P.geo.orb);   // the row tails
         if (ot + G < O_TILES) pf_l2(P.lwo + (size_t) ((ot + G) * 16) * P.geo.orow, (size_t) 16 * P.geo.orow);
         STP(true, ST_OUT_REQ1);
     };
@@ -372,8 +372,8 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
         MW(&P.ofull, PB_OW);
         STP(tid == 0, ST_OFULL);
         const uint8_t* slot = reinterpret_cast<const uint8_t*>(sm);
-        if constexpr (FO == 8) {
-            // Q8_0: the warp order of the one-kernel projection it replaces (dense_tc's 1024-value chunks over two warp
+        if constexpr (FO == 8 || FO == 46) {
+            // Q8_0 / MXFP8: the warp order of the one-kernel projection it replaces (dense_tc's 1024-value chunks over two warp
             // groups): warp 4 * ks + hb adds its half super-block of the 512-value chunks 2 j + ks in order
             if (wp < 8) {
                 const int hb = wp & 3, ks = wp >> 2, sbi = hb >> 1, n = hb & 1;
@@ -405,13 +405,13 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
                             xf.d8[k4][e2] = col < T ? (oxs ? __low2float(*reinterpret_cast<const half2*>(xd)) : __half2float(__ushort_as_half(ldca16(xd)))) : 0.0f;
                         }
                     }
-                    constexpr int SB = Fmt<8>::SB;
+                    constexpr int SB = Fmt<FO>::SB;
                     const uint8_t* pp[2] = {rowA + cch * 2 * SB, rowB + cch * 2 * SB};
                     if (cch >= O_Q8_SMEM_CH) {   // past the smem part: this CTA's rows in the weights (prefetched to L2)
                         const uint8_t* gw = P.lwo + (size_t) (ot * 16) * P.geo.orow + sbi * osb + cch * 2 * SB;
                         pp[0] = gw + (size_t) g * P.geo.orow; pp[1] = gw + (size_t) (g + 8) * P.geo.orow;
                     }
-                    half_sb_terms<8>(acc, pp, n, t, xf, 0u, 0u, 0u, 0u, P.grid);
+                    half_sb_terms<FO>(acc, pp, n, t, xf, 0u, 0u, 0u, 0u, P.grid);
                 }
                 float* rw = red + wp * 16 * RC;
                 if (2 * t + 1 < RC) {
@@ -484,7 +484,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
                 constexpr int WS = 16 * RC;
                 const float* rr2 = red + row * RC + col;
                 float bov;
-                if constexpr (FO == 8) {   // ((hb0 + hb1) + hb2) + hb3 per warp group, then the groups
+                if constexpr (FO == 8 || FO == 46) {   // ((hb0 + hb1) + hb2) + hb3 per warp group, then the groups
                     bov = (((rr2[0] + rr2[WS]) + rr2[2 * WS]) + rr2[3 * WS]) + (((rr2[4 * WS] + rr2[5 * WS]) + rr2[6 * WS]) + rr2[7 * WS]);
                 } else {
                     float h[4];
@@ -532,17 +532,18 @@ MidDev& mid_dev() {
 constexpr int kMidCtas = R_CTA0 + R_HV;   // the grid that keeps the tuned split; a device with fewer SMs gets one CTA per SM
 constexpr int kMidMinCtas = 16;
 using MFn = void (*)(MP);
-bool type_ok(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 21 || t == 23; }
-// Q8_0 has its own instance: all three types Q8_0, not the stamping build
+bool type_ok(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 21 || t == 23 || t == 46; }
+// Q8_0 and MXFP8 each have their own uniform instance: all three types equal, not the stamping build
 bool types_ok(const MidChainArgs& a) {
     if (!type_ok(a.type_q) || !type_ok(a.type_z) || !type_ok(a.type_o)) return false;
     const int n8 = (a.type_q == 8) + (a.type_z == 8) + (a.type_o == 8);
-    return n8 == 0 || (n8 == 3 && a.stamps == nullptr);
+    const int n46 = (a.type_q == 46) + (a.type_z == 46) + (a.type_o == 46);
+    return (n8 == 0 && n46 == 0) || ((n8 == 3 || n46 == 3) && a.stamps == nullptr);
 }
 
 // One kernel per (window rows, projection types) for the projection type triples of the packs, and the generic one (the
 // types picked at run time) for any other.
-#define MID_TRIPLES X(14, 14, 14) X(23, 21, 12) X(8, 8, 8)
+#define MID_TRIPLES X(14, 14, 14) X(23, 21, 12) X(8, 8, 8) X(46, 46, 46)
 template <int T>
 MFn mid_pick_t(int q, int z, int o) {
 #define X(a, b, c) if (q == a && z == b && o == c) return k_mid<T, a, b, c, false>;

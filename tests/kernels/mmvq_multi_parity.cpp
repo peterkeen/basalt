@@ -75,6 +75,8 @@ const Case CASES[] = {
     {"Q6_K short", 14, 1280, 8187, 256, 210, {208, -1}},   // rows of 5 blocks, enough of them for the staged kernel
     {"IQ4_XS", 23, 4096, 512, 256, 136, {0, -1}},     // IQ4XSBlock: half d; n_in 4096, see THE NEGATIVE CONTROL
     {"Q5_K wide", 13, 4096, 2048, 256, 176, {0, 2}},
+    {"MXFP8", 46, 2048, 512, 128, 132, {-1, -1}},     // MXFP8Block: e[4] UE8M0, qs[128] E4M3
+    {"MXFP8 short", 46, 640, 2560, 128, 132, {-1, -1}},   // shared-expert down shape (5 blocks < BPI=8)
 };
 
 // a normal fp16 in +-[2^-10, 2^-5): exponent field 5..9 (bias 15), any mantissa, either sign
@@ -117,12 +119,19 @@ long long compare(const Case& c, int T, cudaStream_t s, long long& nonfinite, lo
                     T, n_blocks, c.block_bytes, wbytes);
         return -1;
     }
-    for (std::size_t k = 0; k < n_blocks; ++k)
+    for (std::size_t k = 0; k < n_blocks; ++k) {
+        if (c.type == 46) {
+            uint8_t* p = &w[k * (std::size_t) c.block_bytes];
+            for (int s = 0; s < 4; ++s) p[s] = (uint8_t) (117 + (rng() % 6));
+            for (int j = 0; j < 128; ++j) if ((p[4 + j] & 0x7Fu) == 0x7Fu) p[4 + j] ^= 1u;
+            continue;
+        }
         for (int at : c.scale_at)
             if (at >= 0) {
                 const uint16_t h = sane_half(rng);
                 std::memcpy(&w[k * (std::size_t) c.block_bytes + (std::size_t) at], &h, 2);
             }
+    }
     std::vector<float> x((std::size_t) T * c.n_in);
     std::normal_distribution<float> nd(0.f, 1.f);
     for (auto& v : x) v = nd(rng);

@@ -107,6 +107,11 @@ struct IQ4NLBlock {
     half d;
     uint8_t qs[16];
 };
+struct alignas(4) MXFP8Block {
+    uint8_t e[4];
+    uint8_t qs[128];
+};
+static_assert(sizeof(MXFP8Block) == 132 && alignof(MXFP8Block) == 4 && offsetof(MXFP8Block, qs) == 4);
 static_assert(sizeof(Q5KBlock) == 176 && alignof(Q5KBlock) == 4);
 static_assert(sizeof(Q81Block) == 36 && alignof(Q81Block) == 4);
 static_assert(sizeof(Q20Block) == 18 && alignof(Q20Block) == 2 && offsetof(Q20Block, qs) == 2);
@@ -1143,6 +1148,61 @@ struct SmallTraits {
     __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int k) { return small_q8_dot(r.w, x, k); }
 };
 
+__device__ __forceinline__ float mxfp8_ue8m0_f32(uint8_t x) {
+    const uint32_t bits = (x == 0) ? 0x00400000u : (x == 0xFF) ? 0x7fc00000u : ((uint32_t) x << 23);
+    return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ float mxfp8_e4m3_f32(uint8_t x) {
+    const uint32_t sign = (uint32_t) (x & 0x80u) << 24;
+    const uint32_t u = x & 0x7Fu;
+    if (u == 0x7Fu) return __uint_as_float(0x7fc00000u);
+    const uint32_t e = u >> 3, m = u & 7u;
+    if (e == 0) {
+        if (m == 0) return __uint_as_float(sign);
+        return __uint_as_float(__float_as_uint((float) m * (1.0f / 512.0f)) | sign);
+    }
+    return __uint_as_float(sign | ((e + 120u) << 23) | (m << 20));
+}
+
+struct MXFP8Traits {
+    using Block = MXFP8Block;
+    static constexpr int DIV = 128, T = 16, KBY = 4, BPI = WARPS * WARP / T;
+    __device__ static int kqs(int tid) { return tid & 15; }
+    struct W { float v[8]; };
+    __device__ static W load(const Block* __restrict__ b, int k) {
+        const int sb = k >> 2, o = (k & 3) * 8;
+        const float d = mxfp8_ue8m0_f32(b->e[sb]);
+        const uint32_t w0 = *reinterpret_cast<const uint32_t*>(b->qs + 32 * sb + o);
+        const uint32_t w1 = *reinterpret_cast<const uint32_t*>(b->qs + 32 * sb + o + 4);
+        W r;
+        r.v[0] = mxfp8_e4m3_f32((uint8_t) w0) * d;
+        r.v[1] = mxfp8_e4m3_f32((uint8_t) (w0 >> 8)) * d;
+        r.v[2] = mxfp8_e4m3_f32((uint8_t) (w0 >> 16)) * d;
+        r.v[3] = mxfp8_e4m3_f32((uint8_t) (w0 >> 24)) * d;
+        r.v[4] = mxfp8_e4m3_f32((uint8_t) w1) * d;
+        r.v[5] = mxfp8_e4m3_f32((uint8_t) (w1 >> 8)) * d;
+        r.v[6] = mxfp8_e4m3_f32((uint8_t) (w1 >> 16)) * d;
+        r.v[7] = mxfp8_e4m3_f32((uint8_t) (w1 >> 24)) * d;
+        return r;
+    }
+    __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int k) {
+        const int sb = k >> 2, o = (k & 3) * 8;
+        const uint32_t q0 = *reinterpret_cast<const uint32_t*>(x[sb].qs + o);
+        const uint32_t q1 = *reinterpret_cast<const uint32_t*>(x[sb].qs + o + 4);
+        float sum = 0.0f;
+        sum = fmaf(r.v[0], (float) (int8_t) q0, sum);
+        sum = fmaf(r.v[1], (float) (int8_t) (q0 >> 8), sum);
+        sum = fmaf(r.v[2], (float) (int8_t) (q0 >> 16), sum);
+        sum = fmaf(r.v[3], (float) (int8_t) (q0 >> 24), sum);
+        sum = fmaf(r.v[4], (float) (int8_t) q1, sum);
+        sum = fmaf(r.v[5], (float) (int8_t) (q1 >> 8), sum);
+        sum = fmaf(r.v[6], (float) (int8_t) (q1 >> 16), sum);
+        sum = fmaf(r.v[7], (float) (int8_t) (q1 >> 24), sum);
+        return __low2float(x[sb].ds) * sum;
+    }
+};
+
 // NW warps per block and ROWS rows per block. The EXACT layout (NW = 4, ROWS = 1, or 4 for small K) is the
 // ncols = 1 layout and keeps every column bitwise equal to a single-column call. The UPSTREAM layout is
 // llama.cpp's generic multi-column table (ncols 2-4: 4 warps; 5-8: 2 warps; always 2 rows per block): faster,
@@ -1999,11 +2059,40 @@ void native_iq4_nl_mmvq(const void* weights, const void* x_q8_1, float* y,
     small_mmvq<IQ4NLBlock, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+void native_mxfp8_mmvq(const void* weights, const void* x_q8_1, float* y,
+                       int n_in, int n_out, int ncols, void* stream) {
+    validate_shape(n_in, ncols, 128);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    if (ncols > 1) {
+        launch_multi<MXFP8Traits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+        launch_check();
+        return;
+    }
+    const auto* w = static_cast<const MXFP8Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const dim3 threads(WARP, WARPS);
+    if (n_in / MXFP8Traits::DIV < MXFP8Traits::BPI) {
+        constexpr int ROWS = 2;
+        const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
+        launch_pdl(native_mmvq_multi_kernel<MXFP8Traits, 1, WARPS, ROWS>, dim3(blocks), threads, 0, s, w, x, y, n_in,
+                   n_out);
+    } else {
+        launch_pdl(native_mmvq_multi_kernel<MXFP8Traits, 1, WARPS, 1>, dim3(unsigned(n_out)), threads, 0, s, w, x, y,
+                   n_in, n_out);
+    }
+    launch_check();
+}
+
 bool native_mmvq_supported(int ggml_type) noexcept {
     return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
-           ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
-           ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
+           ggml_type == 23 || ggml_type == 42 || ggml_type == 46 || ggml_type == 16 || ggml_type == 17 ||
+           ggml_type == 18 || ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
 }
 
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
@@ -2020,6 +2109,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 14: block_elems = 256; block_bytes = 210; break;
     case 23: block_elems = 256; block_bytes = 136; break;
     case 42: block_elems = 64; block_bytes = 18; break;
+    case 46: block_elems = 128; block_bytes = 132; break;
     case 16: case 17: case 18: case 21: case 22: case 29:
         block_elems = 256; block_bytes = (int) iq_row_bytes(ggml_type, 256); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
@@ -2047,6 +2137,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 14: native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 46: native_mxfp8_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 16: case 17: case 18: case 21: case 22: case 29:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");

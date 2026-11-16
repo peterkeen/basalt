@@ -33,6 +33,7 @@ bool cpu_block(int type, const uint8_t* b, float* out) {
     case 20: dequantize_iq4_nl(b, out); return true;
     case 23: dequantize_iq4_xs(b, out); return true;
     case 42: dequantize_q2_0(b, out); return true;
+    case 46: dequantize_mxfp8(b, out); return true;
     default: return false;
     }
 }

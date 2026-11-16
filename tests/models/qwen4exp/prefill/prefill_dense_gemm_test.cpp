@@ -74,6 +74,13 @@ std::vector<uint8_t> make_weights(ggml_type tp, int64_t N, int64_t K, std::mt199
             const ggml_fp16_t h = ggml_fp32_to_fp16(sd(rng));
             std::memcpy(raw.data() + b * bs + 208, &h, 2);
         }
+    } else if (tp == GGML_TYPE_MXFP8) {
+        std::uniform_int_distribution<int> exp8(116, 121);
+        for (size_t b = 0; b < nb; ++b) {
+            uint8_t* p = raw.data() + b * bs;
+            for (int s = 0; s < 4; ++s) p[s] = (uint8_t) exp8(rng);
+            for (int j = 0; j < 128; ++j) if ((p[4 + j] & 0x7Fu) == 0x7Fu) p[4 + j] ^= 1u;
+        }
     } else {
         float lo = 0.0008f, mid = 0.0f;
         if (tp == GGML_TYPE_Q4_K) { lo = 0.0002f; mid = 7.5f; }
@@ -152,6 +159,8 @@ void parity_part(cudaStream_t s) {
         {GGML_TYPE_IQ4_XS, 113, 512,  2560, 512,  0.0f,  "IQ4_XS [512,2560] T=113"},
         {GGML_TYPE_IQ4_NL, 131, 640,  2560, 640,  0.0f,  "IQ4_NL [640,2560] T=131"},
         {GGML_TYPE_Q8_0,   193, 2560, 640,  2592, -0.5f, "Q8_0 [2560,640] T=193 ldy=2592 beta=-0.5"},
+        {GGML_TYPE_MXFP8,  193, 2560, 640,  2592, -0.5f, "MXFP8 [2560,640] T=193 ldy=2592 beta=-0.5"},
+        {GGML_TYPE_MXFP8,  129, 640,  2560, 640,  0.0f,  "MXFP8 [640,2560] T=129"},
     };
 
     std::mt19937 rng(4242);
