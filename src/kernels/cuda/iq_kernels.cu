@@ -3093,6 +3093,8 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
         case 40: return (size_t) (n / 64) * sizeof(block_nvfp4);
+        case 46: return (size_t) (n / 128) * sizeof(block_mxfp8);
+        case 47: return (size_t) (n / 32) * sizeof(block_nvfp4_32);
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
         default: return 0;
     }

@@ -324,6 +324,45 @@ inline void dequantize_mxfp4(const uint8_t* block, float* out) {
     }
 }
 
+// ---- NVFP4_32: 32 elements from an 18-byte block { uint8 d[2] (UE4M3); uint8 qs[16] }.
+inline void dequantize_nvfp4_32(const uint8_t* block, float* out) {
+    const uint8_t* d = block;
+    const uint8_t* qs = block + 2;
+    for (int s = 0; s < 2; ++s) {
+        const float sc = ue4m3_to_fp32_half(d[s]);
+        for (int j = 0; j < 8; ++j) {
+            out[16 * s + j] = (float)kvalues_fp4[qs[8 * s + j] & 0x0F] * sc;
+            out[16 * s + j + 8] = (float)kvalues_fp4[qs[8 * s + j] >> 4] * sc;
+        }
+    }
+}
+
+// ---- MXFP8: 128 elements from a 132-byte block { uint8 e[4] (UE8M0); uint8 qs[128] (E4M3) }.
+inline float ue8m0_to_fp32(uint8_t x) {
+    const uint32_t bits = (x == 0) ? 0x00400000u : (x == 0xFF) ? 0x7fc00000u : ((uint32_t)x << 23);
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+inline float e4m3_to_fp32(uint8_t x) {
+    const float sign = (x & 0x80) ? -1.0f : 1.0f;
+    const uint8_t u = x & 0x7F;
+    if (u == 0x7F) return NAN;
+    const int e = (u >> 3) & 0xF, m = u & 0x7;
+    if (e == 0) return m == 0 ? std::copysign(0.0f, sign) : sign * std::ldexp((float)m, -9);
+    return sign * std::ldexp((float)(8 + m), e - 10);
+}
+
+inline void dequantize_mxfp8(const uint8_t* block, float* out) {
+    const uint8_t* e = block;
+    const uint8_t* qs = block + 4;
+    for (int s = 0; s < 4; ++s) {
+        const float d = ue8m0_to_fp32(e[s]);
+        for (int j = 0; j < 32; ++j) out[32 * s + j] = e4m3_to_fp32(qs[32 * s + j]) * d;
+    }
+}
+
 // ---- element types
 inline void dequantize_f32(const uint8_t* p, float* out, int n) {
     std::memcpy(out, p, (size_t)n * 4);

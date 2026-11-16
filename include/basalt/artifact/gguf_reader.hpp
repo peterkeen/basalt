@@ -100,6 +100,10 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 46:
+        return "MXFP8";
+    case 47:
+        return "NVFP4_32";
     default:
         return "?";
     }
@@ -203,6 +207,14 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         return true;
     case 42:
         elems = 64;
+        bytes = 18;
+        return true;
+    case 46:   // MXFP8
+        elems = 128;
+        bytes = 132;
+        return true;
+    case 47:   // NVFP4_32
+        elems = 32;
         bytes = 18;
         return true;
     default:

@@ -43,7 +43,9 @@ enum ggml_type {
     GGML_TYPE_IQ1_M = 29,
     GGML_TYPE_NVFP4 = 40,
     GGML_TYPE_Q2_0 = 42,
-    GGML_TYPE_COUNT = 43,
+    GGML_TYPE_MXFP8 = 46,
+    GGML_TYPE_NVFP4_32 = 47,
+    GGML_TYPE_COUNT = 48,
 };
 
 typedef uint16_t ggml_fp16_t;

@@ -1479,6 +1479,119 @@ float ggml_fp16_to_fp32(ggml_fp16_t x) { return GGML_FP16_TO_FP32(x); }
 
 ggml_fp16_t ggml_fp32_to_fp16(float x) { return GGML_FP32_TO_FP16(x); }
 
+void dequantize_row_nvfp4_32(const block_nvfp4_32 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_NVFP4_32 == 0);
+    const int64_t nb = k / QK_NVFP4_32;
+    for (int64_t i = 0; i < nb; i++) {
+        for (int s = 0; s < QK_NVFP4_32 / QK_NVFP4_SUB; s++) {
+            const float d = ggml_ue4m3_to_fp32(x[i].d[s]);
+            const uint8_t * qs = x[i].qs + s * 8;
+            float * yb = y + i * QK_NVFP4_32 + s * QK_NVFP4_SUB;
+            for (int j = 0; j < 8; ++j) {
+                yb[j + 0] = kvalues_fp4[qs[j] & 0xf] * d;
+                yb[j + 8] = kvalues_fp4[qs[j] >> 4] * d;
+            }
+        }
+    }
+}
+
+void quantize_row_nvfp4_32_ref(const float * GGML_RESTRICT x, block_nvfp4_32 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_NVFP4_32 == 0);
+    const int64_t nb = k / QK_NVFP4_32;
+    for (int64_t i = 0; i < nb; i++) {
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int s = 0; s < QK_NVFP4_32 / QK_NVFP4_SUB; s++) {
+            const float * xb = x + i * QK_NVFP4_32 + s * QK_NVFP4_SUB;
+            float amax = 0.0f;
+            for (int j = 0; j < QK_NVFP4_SUB; j++) amax = fmaxf(amax, fabsf(xb[j]));
+            const float target = amax / 6.0f;
+            int best = 0;
+            float best_err = INFINITY;
+            for (int c = 0; c < 0x7F; c++) {
+                const float err = fabsf(2.0f * ggml_ue4m3_to_fp32((uint8_t) c) - target);
+                if (err < best_err) { best_err = err; best = c; }
+            }
+            y[i].d[s] = (uint8_t) best;
+            const float d = ggml_ue4m3_to_fp32((uint8_t) best);
+            for (int j = 0; j < QK_NVFP4_SUB; j++) {
+                int q = 0;
+                float q_err = INFINITY;
+                for (int c = 0; c < 16; c++) {
+                    const float err = fabsf(kvalues_fp4[c] * d - xb[j]);
+                    if (err < q_err) { q_err = err; q = c; }
+                }
+                y[i].qs[s * 8 + (j & 7)] |= (uint8_t) (j < 8 ? q : q << 4);
+            }
+        }
+    }
+}
+
+static inline float ggml_ue8m0_to_fp32(uint8_t x) {
+    const uint32_t bits = (x == 0) ? 0x00400000u : (x == 0xFF) ? 0x7fc00000u : ((uint32_t) x << 23);
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    const float sign = (x & 0x80) ? -1.0f : 1.0f;
+    const uint8_t u = x & 0x7F;
+    if (u == 0x7F) return NAN;
+    const int exp = (u >> 3) & 0xF, man = u & 0x7;
+    if (exp == 0) return man == 0 ? copysignf(0.0f, sign) : sign * ldexpf((float) man, -9);
+    return sign * ldexpf((float) (8 + man), exp - 10);
+}
+
+void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP8 == 0);
+    const int64_t nb = k / QK_MXFP8;
+    for (int64_t i = 0; i < nb; i++) {
+        for (int s = 0; s < QK_MXFP8 / QK_MXFP8_SUB; s++) {
+            const float d = ggml_ue8m0_to_fp32(x[i].e[s]);
+            const uint8_t * qs = x[i].qs + s * QK_MXFP8_SUB;
+            float * yb = y + i * QK_MXFP8 + s * QK_MXFP8_SUB;
+            for (int j = 0; j < QK_MXFP8_SUB; ++j) yb[j] = ggml_e4m3_to_fp32(qs[j]) * d;
+        }
+    }
+}
+
+void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP8 == 0);
+    const int64_t nb = k / QK_MXFP8;
+    for (int64_t i = 0; i < nb; i++) {
+        for (int s = 0; s < QK_MXFP8 / QK_MXFP8_SUB; s++) {
+            const float * xb = x + i * QK_MXFP8 + s * QK_MXFP8_SUB;
+            float amax = 0.0f;
+            for (int j = 0; j < QK_MXFP8_SUB; j++) amax = fmaxf(amax, fabsf(xb[j]));
+            int e = 0;
+            if (amax > 0.0f) {
+                int exp = 0;
+                frexpf(amax / 448.0f, &exp);
+                const float lo = ldexpf(1.0f, exp - 1);
+                const int pow2 = (lo * 448.0f >= amax) ? (exp - 1) : exp;
+                e = pow2 + 127;
+                if (e < 0) e = 0;
+                if (e > 254) e = 254;
+            }
+            y[i].e[s] = (uint8_t) e;
+            const float d = ggml_ue8m0_to_fp32((uint8_t) e);
+            const float id = d > 0.0f ? 1.0f / d : 0.0f;
+            for (int j = 0; j < QK_MXFP8_SUB; j++) {
+                const float v = xb[j] * id;
+                const uint8_t sign = signbit(v) ? 0x80 : 0x00;
+                const float av = fabsf(v);
+                int best = 0;
+                float best_err = INFINITY;
+                for (int c = 0; c < 0x7F; c++) {
+                    const float err = fabsf(ggml_e4m3_to_fp32((uint8_t) c) - av);
+                    if (err < best_err) { best_err = err; best = c; }
+                }
+                y[i].qs[s * QK_MXFP8_SUB + j] = sign | (uint8_t) best;
+            }
+        }
+    }
+}
+
 static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
 #define TYPE(id, name, blck, block, to, from) \
     [id] = {name, blck, sizeof(block), (ggml_to_float_t) (to), (ggml_from_float_t) (from)}
@@ -1503,6 +1616,8 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     TYPE(GGML_TYPE_IQ1_S, "iq1_s", QK_K, block_iq1_s, dequantize_row_iq1_s, NULL),
     TYPE(GGML_TYPE_IQ1_M, "iq1_m", QK_K, block_iq1_m, dequantize_row_iq1_m, NULL),
     TYPE(GGML_TYPE_NVFP4, "nvfp4", QK_NVFP4, block_nvfp4, dequantize_row_nvfp4, quantize_row_nvfp4_ref),
+    TYPE(GGML_TYPE_MXFP8, "mxfp8", QK_MXFP8, block_mxfp8, dequantize_row_mxfp8, quantize_row_mxfp8_ref),
+    TYPE(GGML_TYPE_NVFP4_32, "nvfp4_32", QK_NVFP4_32, block_nvfp4_32, dequantize_row_nvfp4_32, quantize_row_nvfp4_32_ref),
 #undef TYPE
 };
 

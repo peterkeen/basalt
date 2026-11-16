@@ -99,6 +99,11 @@ int iq4nl_code(int code);
 /// a perfectly plausible embedding of the wrong 160 values.
 void iq4nl_dequant_row(const uint8_t* row, float* out160);
 
+/// One 90-byte NVFP4_32 row -> 160 floats: five 18-byte blocks of {d[2] UE4M3, qs[16] E2M1}, multiplied by `scale`
+/// (`qwen4exp.ple.scale`, 1.0 when absent). Within each 16-value sub-block s, qs[8 s + j] holds element j in its low
+/// nibble and element j + 8 in its high nibble.
+void nvfp4_ple_dequant_row(const uint8_t* row, float scale, float* out160);
+
 /// How the table's rows are read. `Direct` is the default: 4 KiB reads from the SSD (platform::DirectFile),
 /// so the table never occupies the process's memory. `Mmap` is the earlier memory-mapped path, kept as the
 /// A/B arm; it returns the same bytes.

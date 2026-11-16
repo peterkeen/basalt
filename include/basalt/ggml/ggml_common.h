@@ -155,6 +155,25 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == QK_NVFP4 / QK_NVFP4_SUB + QK_NVFP4 / 2, "wrong nvfp4 block size/padding");
 
+// NVFP4_32: two 16-value NVFP4 sub-blocks (32 values in 18 bytes), for rows whose width is a multiple of 32
+// rather than 64 (such as 160-wide per-layer embedding rows). Sub-block s keeps its E2M1 codes in qs[8 s .. 8 s + 7]
+// with the same low/high nibble split as block_nvfp4.
+#define QK_NVFP4_32 32
+typedef struct {
+    uint8_t d[QK_NVFP4_32 / QK_NVFP4_SUB];   // UE4M3 sub-block scales
+    uint8_t qs[QK_NVFP4_32 / 2];             // E2M1 codes, 4 bits each
+} block_nvfp4_32;
+static_assert(sizeof(block_nvfp4_32) == QK_NVFP4_32 / QK_NVFP4_SUB + QK_NVFP4_32 / 2, "wrong nvfp4_32 block size/padding");
+
+// MXFP8: 128 E4M3 values in four 32-value sub-blocks, each with a UE8M0 power-of-two scale (132 bytes, 4-byte aligned).
+#define QK_MXFP8 128
+#define QK_MXFP8_SUB 32
+typedef struct {
+    uint8_t e[QK_MXFP8 / QK_MXFP8_SUB];   // UE8M0 sub-block scales: 2^(e - 127), 0xFF = NaN
+    uint8_t qs[QK_MXFP8];                 // E4M3 codes, 1 byte each
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == QK_MXFP8 / QK_MXFP8_SUB + QK_MXFP8, "wrong mxfp8 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta

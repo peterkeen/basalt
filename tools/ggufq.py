@@ -41,6 +41,7 @@ class GGMLQuantizationType(IntEnum):
     IQ4_XS = 23
     IQ1_M = 29
     BF16 = 30
+    MXFP8 = 46
 
 
 # (values per block, bytes per block)
@@ -67,6 +68,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.IQ4_XS:  (256, 2 + 2 + QK_K // 2 + QK_K // 64),
     GGMLQuantizationType.IQ1_M:   (256, QK_K // 8 + QK_K // 16 + QK_K // 32),
     GGMLQuantizationType.BF16:    (1, 2),
+    GGMLQuantizationType.MXFP8:   (128, 4 + 128),
 }
 
 
@@ -1088,3 +1090,29 @@ class IQ4_XS(_Quant, qtype=GGMLQuantizationType.IQ4_XS):
         qs = np.take_along_axis(kvalues, qs, axis=-1).astype(np.float32).reshape((n_blocks, -1, 32))
 
         return (dl * qs).reshape((n_blocks, -1))
+
+
+class MXFP8(_Quant, qtype=GGMLQuantizationType.MXFP8):
+    _e4m3: np.ndarray | None = None
+
+    @classmethod
+    def _table(cls) -> np.ndarray:
+        if cls._e4m3 is None:
+            b = np.arange(256)
+            sign = np.where(b >> 7, -1.0, 1.0)
+            e, m = (b >> 3) & 15, b & 7
+            v = np.where(e == 0, m * (2.0 ** -9), (8 + m) * (2.0 ** (e.astype(np.float64) - 10)))
+            v = np.where((e == 15) & (m == 7), np.nan, v)
+            cls._e4m3 = (sign * v).astype(np.float32)
+        return cls._e4m3
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        e, qs = np.hsplit(blocks, [4])
+        eu = e.astype(np.uint32)
+        bits = np.where(eu == 0, np.uint32(0x00400000),
+                        np.where(eu == 255, np.uint32(0x7FC00000), eu << np.uint32(23)))
+        d = bits.view(np.float32).reshape((n_blocks, 4, 1))
+        vals = cls._table()[qs.reshape((n_blocks, 4, 32))]
+        return (vals * d).reshape((n_blocks, 128))

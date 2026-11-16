@@ -83,6 +83,23 @@ void ngram_rows(const int32_t* tokens, const int32_t* prev, int n_tokens, const 
 
 namespace {
 const int8_t kIq4Nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+constexpr int8_t kFp4Code[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+constexpr float ue4m3_half_at(int x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const int e = (x >> 3) & 0xF, m = x & 0x7;
+    if (e == 0) return (float) m * (1.0f / 1024.0f);
+    const float mant = (float) (8 + m);
+    return e >= 11 ? mant * (float) (1u << (e - 11)) : mant * (1.0f / (float) (1u << (11 - e)));
+}
+
+struct Ue4m3HalfTable {
+    float v[128] = {};
+    constexpr Ue4m3HalfTable() {
+        for (int i = 0; i < 128; ++i) v[i] = ue4m3_half_at(i);
+    }
+};
+constexpr Ue4m3HalfTable kUe4m3Half{};
 }
 
 int iq4nl_code(int code) { return kIq4Nl[code & 15]; }
@@ -102,8 +119,24 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
     }
 }
 
+void nvfp4_ple_dequant_row(const uint8_t* row, float scale, float* out160) {
+    for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
+        const uint8_t* blk = row + (size_t) b * 18;
+        for (int s = 0; s < 2; ++s) {
+            const float sc = kUe4m3Half.v[blk[s] & 0x7F] * scale;
+            const uint8_t* qs = blk + 2 + (size_t) s * 8;
+            float* dst = out160 + b * 32 + s * 16;
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t q = qs[j];
+                dst[j] = (float) kFp4Code[q & 0x0F] * sc;
+                dst[j + 8] = (float) kFp4Code[q >> 4] * sc;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
-enum class PleFormat { IQ4_NL, Q5_0, Q8_0, BF16 };
+enum class PleFormat { IQ4_NL, Q5_0, Q8_0, BF16, NVFP4 };
 
 struct PleTable::Impl {
     GgufFile* file = nullptr;
@@ -130,6 +163,7 @@ struct PleTable::Impl {
     uint32_t prefetch_keys[kMaxPrefetch][PLE_N_HEADS] = {};
     uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
+    float ple_scale = 1.0f;           // per-tensor FP32 multiplier (qwen4exp.ple.scale)
     void decode(const uint8_t* row, float* out160) const {
         switch (fmt) {
         case PleFormat::Q5_0:
@@ -147,6 +181,9 @@ struct PleTable::Impl {
                 std::memcpy(&f, &w, 4);
                 out160[j] = f;
             }
+            break;
+        case PleFormat::NVFP4:
+            nvfp4_ple_dequant_row(row, ple_scale, out160);
             break;
         default: iq4nl_dequant_row(row, out160); break;
         }
@@ -180,15 +217,26 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // IQ4_NL, Q5_0, Q8_0 or BF16 rows
+    // IQ4_NL, Q5_0, Q8_0, BF16 or NVFP4_32 rows
     if (std::strcmp(t->type_name(), "IQ4_NL") == 0) impl_->fmt = PleFormat::IQ4_NL;
     else if (std::strcmp(t->type_name(), "Q5_0") == 0) impl_->fmt = PleFormat::Q5_0;
     else if (std::strcmp(t->type_name(), "Q8_0") == 0) impl_->fmt = PleFormat::Q8_0;
     else if (std::strcmp(t->type_name(), "BF16") == 0) impl_->fmt = PleFormat::BF16;
+    else if (std::strcmp(t->type_name(), "NVFP4_32") == 0) impl_->fmt = PleFormat::NVFP4;
     else {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0, Q8_0 or BF16";
+        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0, Q8_0, BF16 or NVFP4_32";
         close();
         return false;
+    }
+    impl_->ple_scale = 1.0f;
+    if (const MetaValue* sc = impl_->file->get("qwen4exp.ple.scale")) {
+        const float v = (float) sc->num();
+        if (!std::isfinite(v) || v <= 0.0f) {
+            err = "qwen4exp.ple.scale must be finite and positive";
+            close();
+            return false;
+        }
+        impl_->ple_scale = v;
     }
     impl_->rb = impl_->fmt == PleFormat::Q8_0 ? PLE_ROW_BYTES_Q8_0
               : impl_->fmt == PleFormat::Q5_0 ? PLE_ROW_BYTES_Q5_0
@@ -307,6 +355,7 @@ void PleTable::close() {
     impl_->data = nullptr;
     impl_->n_rows = 0;
     impl_->rb = PLE_ROW_BYTES;
+    impl_->ple_scale = 1.0f;
     impl_->fmt = PleFormat::IQ4_NL;
 }
 
@@ -314,7 +363,7 @@ bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.
 bool PleTable::locked() const { return impl_->locked; }
 const char* PleTable::format() const {
     return impl_->fmt == PleFormat::Q8_0 ? "Q8_0" : impl_->fmt == PleFormat::Q5_0 ? "Q5_0"
-           : impl_->fmt == PleFormat::BF16 ? "BF16" : "IQ4_NL";
+           : impl_->fmt == PleFormat::BF16 ? "BF16" : impl_->fmt == PleFormat::NVFP4 ? "NVFP4_32" : "IQ4_NL";
 }
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
