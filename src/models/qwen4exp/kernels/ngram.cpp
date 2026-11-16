@@ -10,6 +10,7 @@
 #include "basalt/platform/mapped_file.hpp"
 #include "basalt/platform/memory.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -42,6 +43,12 @@ PleConsts ple_artifact_consts() {
         c.offset[i] = offset[i];
     }
     return c;
+}
+
+uint64_t ple_row_space(const PleConsts& c) {
+    uint64_t space = 0;
+    for (int h = 0; h < PLE_N_HEADS; ++h) space = std::max(space, c.offset[h] + c.vocab[h]);
+    return space;
 }
 
 uint64_t ngram_mixed(const int64_t* ctx, const uint64_t* mult, int n) {
@@ -106,6 +113,7 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
 enum class PleFormat { IQ4_NL, Q5_0, Q8_0, BF16 };
 
 struct PleTable::Impl {
+    std::string path;            // the file the table was opened from (the model file, or --ple-file)
     GgufFile* file = nullptr;
     const uint8_t* data = nullptr;
     uint64_t n_rows = 0;
@@ -162,6 +170,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err) {
 
 bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoOptions& io) {
     close();
+    impl_->path = gguf_path;
     try {
         impl_->file = new GgufFile(gguf_path);
     } catch (const std::exception& e) {
@@ -174,9 +183,13 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // [160, 320001536]: ne0 = 160 is the FAST axis, so the ROW index is shape[1] and a row is contiguous.
+    // [160, 320001536]: ne0 = 160 is the FAST axis, so the ROW index is shape[1] and a row is contiguous.  The
+    // message names the file: with --ple-file it is not the file the weights come from.
     if (t->shape.size() != 2 || t->shape[0] != (uint64_t) PLE_HEAD_DIM) {
-        err = "per_layer_token_embd.weight has an unexpected shape";
+        std::string dims;
+        for (size_t d = 0; d < t->shape.size(); ++d) dims += (d ? ", " : "") + std::to_string(t->shape[d]);
+        err = "per_layer_token_embd.weight in " + gguf_path + " has shape [" + dims + "], expected [" +
+              std::to_string(PLE_HEAD_DIM) + ", rows]";
         close();
         return false;
     }
@@ -186,7 +199,8 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     else if (std::strcmp(t->type_name(), "Q8_0") == 0) impl_->fmt = PleFormat::Q8_0;
     else if (std::strcmp(t->type_name(), "BF16") == 0) impl_->fmt = PleFormat::BF16;
     else {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0, Q8_0 or BF16";
+        err = std::string("per_layer_token_embd.weight in ") + gguf_path + " is " + t->type_name() +
+              ", not IQ4_NL, Q5_0, Q8_0 or BF16";
         close();
         return false;
     }
@@ -212,12 +226,12 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     if (alone ? need != have : t->offset + need > have) {
         char buf[256];
         std::snprintf(buf, sizeof buf,
-                      "PLE table size mismatch: %llu rows x %d B = %llu at offset %llu, but the file holds %llu from "
+                      "size mismatch: %llu rows x %d B = %llu at offset %llu, but the file holds %llu from "
                       "data_start %llu",
                       (unsigned long long) impl_->n_rows, (int) impl_->rb, (unsigned long long) need,
                       (unsigned long long) t->offset, (unsigned long long) have,
                       (unsigned long long) impl_->file->data_start());
-        err = buf;
+        err = "per_layer_token_embd.weight in " + gguf_path + ": " + buf;
         close();
         return false;
     }
@@ -299,6 +313,7 @@ void PleTable::prefetch_rows(const uint32_t* rows16) {
 void PleTable::close() {
     wait_prefetches();
     impl_->reader.close();
+    impl_->path.clear();
     impl_->pending = false;
     impl_->locked = false;   // the unmap below releases the lock
     impl_->mode = PleIo::Mmap;
@@ -311,6 +326,7 @@ void PleTable::close() {
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
+const std::string& PleTable::source() const { return impl_->path; }
 bool PleTable::locked() const { return impl_->locked; }
 const char* PleTable::format() const {
     return impl_->fmt == PleFormat::Q8_0 ? "Q8_0" : impl_->fmt == PleFormat::Q5_0 ? "Q5_0"
@@ -318,6 +334,18 @@ const char* PleTable::format() const {
 }
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
+
+bool PleTable::covers(const PleConsts& c, std::string& err) const {
+    const uint64_t need = ple_row_space(c);
+    if (impl_->n_rows >= need) return true;
+    char buf[256];
+    std::snprintf(buf, sizeof buf,
+                  "the n-gram table in %s has %llu rows, but the n-gram hash indexes rows up to %llu: it is a "
+                  "table for a different model, and reading it would run past its end",
+                  impl_->path.c_str(), (unsigned long long) impl_->n_rows, (unsigned long long) (need - 1));
+    err = buf;
+    return false;
+}
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
 
 void PleTable::read_row(uint32_t row, float* out160) const {

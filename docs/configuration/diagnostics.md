@@ -62,6 +62,7 @@ report them, rather than presenting a partial sum as the whole request.
 | Flag | Binary | Default | What it does |
 |---|---|---|---|
 | `--ple-io direct`, `ram` | engine | `direct` | Read the n-gram table unbuffered (`direct`) or lock it in RAM (`ram`). |
+| `--ple-file PATH` | engine | unset (the model file) | Flash-Next: read `per_layer_token_embd.weight` from this GGUF instead of the model file's `gguf` section; the six `blk.1.ple_*` weights, dense weights and experts still come from the pack. IQ4_NL, Q5_0, Q8_0 or BF16, shape `[160, rows]`, other tensors may share the file, and the rows must reach every index the n-gram hash produces (320,001,446), so a table of another model is refused at start. A different table is a different model: the start-up line names the file (`PLE on, table N rows of FILE (TYPE)`) and the file joins the identity parked conversations are bound to. Give an absolute path in a config file. |
 | `--ple-row-cache`, `--ple-inflight`, `--ple-delay-us` | engine | 1048576 rows, 256, 0 | Row cache size, outstanding reads, and injected read delay for tests. |
 
 ## Quality gate and bench

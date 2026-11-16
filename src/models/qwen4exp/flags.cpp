@@ -34,6 +34,7 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--dump-mixed") o.dump_mixed = args.next("--dump-mixed");
     else if (a == "--dump-routing") o.dump_routing = args.next("--dump-routing");
     else if (a == "--ple-io") o.ple_io = args.next("--ple-io");
+    else if (a == "--ple-file") o.ple_file = args.next("--ple-file");
     else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(args.next("--ple-row-cache"));
     else if (a == "--ple-inflight") o.ple_inflight = std::atoi(args.next("--ple-inflight"));
     else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(args.next("--ple-delay-us"));

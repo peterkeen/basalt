@@ -29,6 +29,7 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 | Router, GDN alpha/beta, indexer, PLE key/value | BF16 as stored | fp32 activations and sums |
 | Hyper-connections | int8 copy, one fp16 scale per 32 inputs (`hc8`); the hc read takes fp32 activations | fp32 sums; the up product uses fp16 hi/lo mma |
 | Token embedding | GGUF type; one row dequantized to fp32 per token | fp32 |
+| N-gram (PLE) table | IQ4_NL, Q5_0, Q8_0 or BF16 as stored, from the pack or from the GGUF `--ple-file` names; only the table's bytes and type reach the dequantizer, so a byte-identical external copy changes nothing and another quantization is another model | 16 rows per token dequantized to fp32 |
 | Output head | Q8_0 (NVFP4 pack) or Q6_K (IQ3_S pack) | two-stage in verify, see [head](#two-stage-verify-head) |
 | Drafter | Q8_0 and BF16 dense; Q2_0 experts in VRAM | proposes only; verify decides |
 | KV cache | fp16 (default), int8 (fp16 scale per 64), q4_0, k8v4 | K/V dequantized to fp32; scores and softmax fp32 |

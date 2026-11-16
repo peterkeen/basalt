@@ -47,7 +47,12 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
     const int64_t geo[] = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_v_heads, g.n_head_kv,
                            g.head_dim, g.idx_key_dim, g.n_expert, g.n_ff};
     h = conversation_store_hash(geo, sizeof geo, h);
-    return basalt::core::conversation_store_hash_file(o.model, h);
+    h = basalt::core::conversation_store_hash_file(o.model, h);
+    // With --ple-file the n-gram table is not in the model file at all, and its values go into the state bytes the
+    // PLE writes (the layer-1 history), so its own identity is folded in the same way.  Without the flag nothing
+    // changes: caches parked before the flag existed stay readable.
+    if (!o.ple_file.empty()) h = basalt::core::conversation_store_hash_file(o.ple_file, h);
+    return h;
 }
 
 // finishes the in-flight host copy; a failed one drops its checkpoint
