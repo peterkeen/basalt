@@ -77,6 +77,9 @@ struct Prefill::Impl {
     std::vector<uint8_t> cpu_nact;
     std::vector<kernels::cpu::ActQ> cpu_actq;
     std::vector<kernels::cpu::ExpertJobMulti> cpu_jobs;
+    std::vector<const void*> cpu_nact_ptrs;
+    std::vector<const kernels::cpu::ActQ*> cpu_act_ptrs;
+    std::vector<float*> cpu_out_ptrs;
     std::vector<char> cpu_need;
     cudaStream_t cpu_s = nullptr;
     cudaEvent_t cpu_ev_in = nullptr, cpu_ev_x = nullptr, cpu_gev[2] = {};

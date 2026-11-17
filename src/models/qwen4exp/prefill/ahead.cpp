@@ -33,21 +33,28 @@ void Prefill::Run::Chunk::copy_ahead(int64_t L) {
     std::vector<std::pair<int32_t, int32_t>> want;   // (-rows, expert)
     for (int32_t e = 0; e < (int32_t) m.g->n_expert; ++e) {
         const int32_t c = m.guess_rows[(size_t) e];
-        if (c <= basalt::kernels::cpu::MAXT || m.host_res[(size_t) L * m.g->n_expert + e] >= 0) continue;
+        if (c <= 0 || m.host_res[(size_t) L * m.g->n_expert + e] >= 0) continue;
         if (ppc && ppc->peer && ppc->peer->has(L, e)) continue;
         if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(L, e)) continue;
         if (!m.src->pinned(L, e)) continue;
         want.emplace_back(-c, e);
     }
     std::sort(want.begin(), want.end());
+    // Leave the lightest tail to the CPU share so copies ahead do not duplicate what the pool will take.
+    const bool cpu_active = owner.cpu_pool_ != nullptr && !stream_all && m.src != nullptr && lay0.native &&
+                            owner.next_ == nullptr && owner.stage_lb_ == 0 && m.cpu_share_now > 0.0;
+    const int ahead_cap = !cpu_active ? ahead_n
+                        : m.cpu_share_now >= 1.0 ? 0
+                        : std::min<int>(ahead_n, (int) std::llround((1.0 - m.cpu_share_now) * (double) want.size()));
     const int b = (int) (L & 1);
     std::vector<int32_t>& slot_of = m.ahead_slot[b];
     std::fill(slot_of.begin(), slot_of.end(), -1);
     m.ahead_layer[b] = L;
+    if (ahead_cap <= 0) return;
     cudaEventRecord(m.ahead_ev, m.cs);
     cudaStreamWaitEvent(m.copy, m.ahead_ev, 0);
     int k = 0;
-    for (size_t i = 0; i < want.size() && k < ahead_n; ++i) {
+    for (size_t i = 0; i < want.size() && k < ahead_cap; ++i) {
         const int32_t e = want[i].second;
         const uint8_t* bl = m.src->blob(L, e);
         if (bl == nullptr) continue;

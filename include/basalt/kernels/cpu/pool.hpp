@@ -36,8 +36,11 @@
 
 namespace basalt::kernels::cpu {
 
-/// One expert for the `nt` tokens of a verify window that were routed to it.  Every token's output is bitwise the
-/// single-token job's.
+/// Maximum token rows a single multi-token expert job holds in SplitBufMulti.
+inline constexpr int kJobMaxT = 64;
+
+/// One expert for the `nt` tokens routed to it (up to MAXT inline, or up to kJobMaxT via *_ext).  Every token's output
+/// is bitwise the single-token job's.
 struct ExpertJobMulti {
     const uint8_t* blob = nullptr;
     int nt = 0;
@@ -45,6 +48,9 @@ struct ExpertJobMulti {
     float* out[MAXT] = {};
     /// a native pack's activations (the layer's `vec_dot_type`), one per token.
     const void* nact[MAXT] = {};
+    const ActQ* const* act_ext = nullptr;
+    float* const* out_ext = nullptr;
+    const void* const* nact_ext = nullptr;
 };
 
 /// How worker threads are allocated across physical/logical CPU cores.  `All` uses every core and is the default; the
@@ -196,9 +202,9 @@ private:
     int mode_ = 0;   // 7 idle work, 8 the native batch
     ExpertJobMulti* mjobs_ = nullptr;
     struct SplitBufMulti {
-        alignas(64) float ff[MAXT][kNativeMaxFF];
-        ActQ a2[MAXT];
-        alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // native down activations
+        alignas(64) float ff[kJobMaxT][kNativeMaxFF];
+        ActQ a2[kJobMaxT];
+        alignas(64) uint8_t hq[kJobMaxT][kNativeHBytes];   // native down activations
     };
     const NativeFmt* nfmt_ = nullptr;
     // run_split_multi_native's one batch per layer (mode 8): per expert, the gate/up parts left to do and whether its

@@ -23,7 +23,9 @@ constexpr int STAGE = 32;
 // Such a chunk also holds, per layer parity, slots for the next layer's experts copied ahead of its routing, after the
 // STAGE slots: about as many as the link moves while a layer's attention half runs, which grows with the chunk.
 constexpr int kAheadSlots = 64;
-inline int ahead_slots(size_t T) { return (int) std::min<size_t>(kAheadSlots, T / 32); }
+inline int ahead_slots(size_t T) {
+    return (int) std::min<size_t>(kAheadSlots, T >= 256 ? std::max<size_t>(32, T / 24) : T / 32);
+}
 // From the chunk size stream_all_min() on, every non-resident expert of every layer streams in a fixed order through a
 // ring_slots()-slot ring (nearly every expert is routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.

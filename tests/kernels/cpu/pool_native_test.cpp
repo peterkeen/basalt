@@ -153,9 +153,9 @@ int main(int argc, char** argv) {
         std::mt19937 rng((uint32_t) (fm.gu * 31 + fm.d));
         std::normal_distribution<float> nd(0.f, 1.f);
         std::vector<float> x(H);
-        fm.nact.assign(MAXT, std::vector<uint8_t>(cpu::kNativeActBytes));
-        fm.actq.resize(MAXT);
-        for (int t = 0; t < MAXT; ++t) {
+        fm.nact.assign(cpu::kJobMaxT, std::vector<uint8_t>(cpu::kNativeActBytes));
+        fm.actq.resize(cpu::kJobMaxT);
+        for (int t = 0; t < cpu::kJobMaxT; ++t) {
             for (auto& v : x) v = nd(rng);
             cpu::native_quant_act(fm.f, x.data(), fm.nact[(size_t) t].data());
             cpu::act_quant_any(x.data(), H, fm.actq[(size_t) t]);
@@ -238,14 +238,63 @@ int main(int argc, char** argv) {
                         break;
                     }
         }
+        // extended jobs (nt > MAXT up to kJobMaxT via *_ext): bitwise equal to 1-token serial runs
+        {
+            const int ext_nts[] = {9, 16, 25, 48, cpu::kJobMaxT};
+            const int n = 5;
+            int total_t = 0;
+            for (int nt : ext_nts) total_t += nt;
+            std::vector<std::vector<float>> want((size_t) total_t, std::vector<float>(H)),
+                got((size_t) total_t, std::vector<float>(H, kSentinel));
+            std::vector<const void*> nact_ext((size_t) total_t);
+            std::vector<const cpu::ActQ*> act_ext((size_t) total_t);
+            std::vector<float*> out_ext((size_t) total_t);
+            std::vector<cpu::ExpertJobMulti> jobs((size_t) n);
+            int cur = 0;
+            for (int e = 0; e < n; ++e) {
+                const int nt = ext_nts[e];
+                cpu::ExpertJobMulti& j = jobs[(size_t) e];
+                j.blob = fm.blobs[(size_t) e].data();
+                j.nt = nt;
+                j.nact_ext = nact_ext.data() + cur;
+                j.act_ext = act_ext.data() + cur;
+                j.out_ext = out_ext.data() + cur;
+                for (int t = 0; t < nt; ++t) {
+                    const int tok = (e * 7 + t) % cpu::kJobMaxT;
+                    nact_ext[(size_t) (cur + t)] = fm.nact[(size_t) tok].data();
+                    act_ext[(size_t) (cur + t)] = &fm.actq[(size_t) tok];
+                    out_ext[(size_t) (cur + t)] = got[(size_t) (cur + t)].data();
+                    float* o1[1] = {want[(size_t) (cur + t)].data()};
+                    Format fm1 = fm;
+                    fm1.nact = {fm.nact[(size_t) tok]};
+                    fm1.actq = {fm.actq[(size_t) tok]};
+                    serial_expert(fm1, j.blob, 1, o1);
+                }
+                cur += nt;
+            }
+            pool.run_split_multi_native(fm.f, jobs.data(), n);
+            ++checked;
+            for (int r = 0; r < total_t; ++r) {
+                if (std::memcmp(want[(size_t) r].data(), got[(size_t) r].data(), H * sizeof(float)) != 0) {
+                    std::printf("MISMATCH ext gu %d down %d row %d\n", fm.gu, fm.d, r);
+                    ++bad;
+                    break;
+                }
+            }
+        }
     }
     std::printf("pool_native_test: %d runs over %zu formats, %d mismatches\n", checked, formats.size(), bad);
 
-    if (bench) {   // a decode layer (15 experts x 2 tokens) and a prompt-sized one (96 x 8), experts far apart in memory
+    if (bench) {   // a decode layer (15 experts x 2 tokens) and prompt-sized multi-token sweeps
         for (const Format& fm : formats) {
-            for (auto shape : {std::pair<int, int>{15, 2}, {96, 8}}) {
+            std::vector<std::pair<int, int>> shapes = {{15, 2}, {96, 8}};
+            if (fm.gu == GGML_TYPE_NVFP4) shapes.push_back({48, 24});
+            for (auto shape : shapes) {
                 const int n = shape.first, nt = shape.second, reps = n > 32 ? 40 : 200;
                 std::vector<std::vector<float>> got((size_t) n * (size_t) nt, std::vector<float>(H));
+                std::vector<const void*> nact_ext((size_t) n * (size_t) nt);
+                std::vector<const cpu::ActQ*> act_ext((size_t) n * (size_t) nt);
+                std::vector<float*> out_ext((size_t) n * (size_t) nt);
                 std::vector<cpu::ExpertJobMulti> jobs((size_t) n);
                 std::vector<double> us;
                 for (int r = 0; r < reps; ++r) {
@@ -253,10 +302,14 @@ int main(int argc, char** argv) {
                         cpu::ExpertJobMulti& j = jobs[(size_t) e];
                         j.blob = fm.blobs[(size_t) ((r * n + e) % kBlobs)].data();
                         j.nt = nt;
+                        const size_t base = (size_t) e * (size_t) nt;
+                        j.nact_ext = nact_ext.data() + base;
+                        j.act_ext = act_ext.data() + base;
+                        j.out_ext = out_ext.data() + base;
                         for (int t = 0; t < nt; ++t) {
-                            j.nact[t] = fm.nact[(size_t) t].data();
-                            j.act[t] = &fm.actq[(size_t) t];
-                            j.out[t] = got[(size_t) e * (size_t) nt + (size_t) t].data();
+                            nact_ext[base + (size_t) t] = fm.nact[(size_t) t].data();
+                            act_ext[base + (size_t) t] = &fm.actq[(size_t) t];
+                            out_ext[base + (size_t) t] = got[base + (size_t) t].data();
                         }
                     }
                     const double t0 = now_ms();
@@ -265,8 +318,9 @@ int main(int argc, char** argv) {
                 }
                 std::sort(us.begin(), us.end());
                 const double med = us[us.size() / 2];
-                std::printf("  gu %2d down %2d: %2d experts x %d tokens, %d workers + host: median %.1f us (%.1f GB/s)\n", fm.gu, fm.d, n, nt,
-                            pool.workers(), med, (double) n * (double) fm.f.bytes / (med * 1e3));
+                std::printf("  gu %2d down %2d: %2d experts x %2d tokens, %d workers + host: median %.1f us (%.1f GB/s)\n",
+                            fm.gu, fm.d, n, nt, pool.workers(), med,
+                            (double) n * (double) fm.f.bytes / (med * 1e3));
             }
         }
     }

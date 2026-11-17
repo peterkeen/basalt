@@ -243,11 +243,11 @@ std::vector<float> download(const Dev& d, size_t n) {
 
 
 // part 1: the CPU pool and MMQ against the reference
-void run_pair(const Pair& p, bool outliers, basalt::kernels::cpu::ExpertPool& pool, cudaStream_t s) {
+void run_pair(const Pair& p, bool outliers, int T, int row_cap, basalt::kernels::cpu::ExpertPool& pool, cudaStream_t s) {
     namespace cpu = basalt::kernels::cpu;
-    constexpr int T = 12, E = 64;
+    constexpr int E = 64;
     const Geo geo(p);
-    std::mt19937 rng(7 + (unsigned) p.gu * 5 + (unsigned) p.d);
+    std::mt19937 rng(7 + (unsigned) p.gu * 5 + (unsigned) p.d + (unsigned) T);
     std::vector<std::vector<uint8_t>> host((size_t) E);
     std::vector<std::unique_ptr<Dev>> dev;
     std::vector<const uint8_t*> blob((size_t) E);
@@ -261,10 +261,10 @@ void run_pair(const Pair& p, bool outliers, basalt::kernels::cpu::ExpertPool& po
     const std::vector<float> x = make_x(T, rng, 5, outliers);
     std::vector<int32_t> ids;
     Routing r;
-    do {   // every expert at most MAXT rows, some with several
+    do {   // every expert at most row_cap rows
         ids = make_ids(T, E, rng, 6, 0);
         r = sort_rows(ids, E);
-    } while (*std::max_element(r.cnt.begin(), r.cnt.end()) > cpu::MAXT);
+    } while (*std::max_element(r.cnt.begin(), r.cnt.end()) > row_cap);
     const int64_t rows = (int64_t) T * K;
     int used = 0, maxr = 0;
     for (int c : r.cnt) { used += c > 0; maxr = std::max(maxr, c); }
@@ -288,17 +288,32 @@ void run_pair(const Pair& p, bool outliers, basalt::kernels::cpu::ExpertPool& po
     std::vector<uint8_t> act((size_t) T * cpu::kNativeActBytes);
     for (int t = 0; t < T; ++t) cpu::native_quant_act(f, x.data() + (size_t) t * N, act.data() + (size_t) t * cpu::kNativeActBytes);
     std::vector<float> y_cpu((size_t) rows * N, std::nanf(""));
+    std::vector<const void*> nact_ext((size_t) rows);
+    std::vector<float*> out_ext((size_t) rows);
     std::vector<cpu::ExpertJobMulti> jobs;
+    size_t ext_at = 0;
     for (int e = 0; e < E; ++e) {
         if (r.cnt[(size_t) e] == 0) continue;
         cpu::ExpertJobMulti j;
         j.blob = host[(size_t) e].data();
         j.nt = r.cnt[(size_t) e];
+        if (j.nt > cpu::MAXT) {
+            j.nact_ext = nact_ext.data() + ext_at;
+            j.out_ext = out_ext.data() + ext_at;
+        }
         for (int i = 0; i < j.nt; ++i) {
             const int32_t row = r.off[(size_t) e] + i;
-            j.nact[i] = act.data() + (size_t) r.src[(size_t) row] * cpu::kNativeActBytes;
-            j.out[i] = y_cpu.data() + (size_t) row * N;
+            const void* ap = act.data() + (size_t) r.src[(size_t) row] * cpu::kNativeActBytes;
+            float* op = y_cpu.data() + (size_t) row * N;
+            if (j.nt <= cpu::MAXT) {
+                j.nact[i] = ap;
+                j.out[i] = op;
+            } else {
+                nact_ext[ext_at + (size_t) i] = ap;
+                out_ext[ext_at + (size_t) i] = op;
+            }
         }
+        if (j.nt > cpu::MAXT) ext_at += (size_t) j.nt;
         jobs.push_back(j);
     }
     pool.run_split_multi_native(f, jobs.data(), (int) jobs.size());   // warm
@@ -393,7 +408,9 @@ int main(int argc, char** argv) {
         basalt::kernels::cpu::ExpertPool pool((std::max)(1, (int) basalt::kernels::cpu::physical_cores(true).size()),
                                                     basalt::kernels::cpu::PoolAffinity::All);
         for (const Pair& p : pairs)
-            for (bool outliers : {false, true}) run_pair(p, outliers, pool, s);
+            for (bool outliers : {false, true}) run_pair(p, outliers, 12, basalt::kernels::cpu::MAXT, pool, s);
+        run_pair(pairs[0], false, 48, basalt::kernels::cpu::kJobMaxT, pool, s);
+        run_pair(pairs[3], true, 48, basalt::kernels::cpu::kJobMaxT, pool, s);
         ck(cudaStreamDestroy(s), "destroy");
         std::printf("prefill CPU share parity passed\n");
         return 0;

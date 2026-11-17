@@ -312,44 +312,59 @@ void ExpertPool::prefetch_until_ready(int e, const uint8_t* p, size_t bytes) con
 void ExpertPool::native_gu_range(int e, int r0, int r1) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
     const ExpertJobMulti& j = mjobs_[e];
+    const ActQ* const* j_act = j.act_ext ? j.act_ext : j.act;
+    const void* const* j_nact = j.nact_ext ? j.nact_ext : j.nact;
     if (q2_native_kernels(nfmt_->gu_type)) {
         // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
         thread_local float gbuf[MAXT][kNativeMaxFF], ubuf[MAXT][kNativeMaxFF];
-        float* gp[MAXT];
-        float* up[MAXT];
-        for (int t = 0; t < j.nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
         const int nbk = (int) (nfmt_->n_embd / 64);
-        q2_rows_any(j.blob, nfmt_->gu_row, nbk, j.act, j.nt, gp, r0, r1);
-        q2_rows_any(j.blob + nfmt_->up_off, nfmt_->gu_row, nbk, j.act, j.nt, up, r0, r1);
-        for (int t = 0; t < j.nt; ++t)
-            for (int r = r0; r < r1; ++r) {
-                float g = gbuf[t][r], u = ubuf[t][r];
-                if (nfmt_->swiglu_limit > 0.f) {
-                    g = std::fmin(g, nfmt_->swiglu_limit);
-                    u = std::fmax(std::fmin(u, nfmt_->swiglu_limit), -nfmt_->swiglu_limit);
+        for (int t0 = 0; t0 < j.nt; t0 += MAXT) {
+            const int m = (std::min)(MAXT, j.nt - t0);
+            float* gp[MAXT];
+            float* up[MAXT];
+            for (int t = 0; t < m; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
+            q2_rows_any(j.blob, nfmt_->gu_row, nbk, j_act + t0, m, gp, r0, r1);
+            q2_rows_any(j.blob + nfmt_->up_off, nfmt_->gu_row, nbk, j_act + t0, m, up, r0, r1);
+            for (int t = 0; t < m; ++t)
+                for (int r = r0; r < r1; ++r) {
+                    float g = gbuf[t][r], u = ubuf[t][r];
+                    if (nfmt_->swiglu_limit > 0.f) {
+                        g = std::fmin(g, nfmt_->swiglu_limit);
+                        u = std::fmax(std::fmin(u, nfmt_->swiglu_limit), -nfmt_->swiglu_limit);
+                    }
+                    sb.ff[t0 + t][r] = (g / (1.f + std::exp(-g))) * u;
                 }
-                sb.ff[t][r] = (g / (1.f + std::exp(-g))) * u;
-            }
+        }
         return;
     }
-    float* ff[MAXT];
-    for (int t = 0; t < j.nt; ++t) ff[t] = sb.ff[t];
-    native_gu_rows(*nfmt_, j.blob, j.nact, j.nt, ff, r0, r1);
+    for (int t0 = 0; t0 < j.nt; t0 += MAXT) {
+        const int m = (std::min)(MAXT, j.nt - t0);
+        float* ff[MAXT];
+        for (int t = 0; t < m; ++t) ff[t] = sb.ff[t0 + t];
+        native_gu_rows(*nfmt_, j.blob, j_nact + t0, m, ff, r0, r1);
+    }
 }
 
 void ExpertPool::native_down_range(int e, int r0, int r1) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
     const ExpertJobMulti& j = mjobs_[e];
+    float* const* j_out = j.out_ext ? j.out_ext : j.out;
     if (q2_native_kernels(nfmt_->d_type)) {
         // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
-        const ActQ* a2[MAXT];
-        for (int t = 0; t < j.nt; ++t) a2[t] = &sb.a2[t];
-        q2_rows_any(j.blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2, j.nt, j.out, r0, r1);
+        for (int t0 = 0; t0 < j.nt; t0 += MAXT) {
+            const int m = (std::min)(MAXT, j.nt - t0);
+            const ActQ* a2[MAXT];
+            for (int t = 0; t < m; ++t) a2[t] = &sb.a2[t0 + t];
+            q2_rows_any(j.blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2, m, j_out + t0, r0, r1);
+        }
         return;
     }
-    const void* hq[MAXT];
-    for (int t = 0; t < j.nt; ++t) hq[t] = sb.hq[t];
-    native_down_rows(*nfmt_, j.blob, hq, j.nt, j.out, r0, r1);
+    for (int t0 = 0; t0 < j.nt; t0 += MAXT) {
+        const int m = (std::min)(MAXT, j.nt - t0);
+        const void* hq[MAXT];
+        for (int t = 0; t < m; ++t) hq[t] = sb.hq[t0 + t];
+        native_down_rows(*nfmt_, j.blob, hq, m, j_out + t0, r0, r1);
+    }
 }
 
 void ExpertPool::native_quantize(int e) {

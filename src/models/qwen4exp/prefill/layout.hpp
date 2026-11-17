@@ -59,7 +59,7 @@ struct MmqPlan {
 };
 
 // A chunk shorter than this leaves most expert tiles nearly empty and the per-expert launches dominate: MMQ is faster.
-constexpr int64_t FP4_MIN_TOKENS = 1024;
+constexpr int64_t FP4_MIN_TOKENS = 256;
 // The peer computes its experts' rows of a streamed chunk of up to this many
 // tokens (PeerPrefill::T_fp4).  The layer's activations go to it and its rows come back through host memory, and the
 // layer's end waits for that round trip; it grows with the chunk while the blobs it saves do not, so a longer chunk

@@ -48,10 +48,11 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_download() {
 
 void Prefill::Run::Chunk::Experts::Group::cpu_select() {
     if (cpu_maybe) {
-        // Experts outside the VRAM cache with a host copy and few rows go to the CPU, fewest rows first, up to the
-        // share at which the CPU and the GPU's streaming end together.  "Outside" is the cache's own table, not
-        // the residency of this read: the slots a read lends, and which lent experts keep a RAM copy, follow its
-        // loan (its chunk, the K/V mode's staging), and the CPU rounds an expert differently from the GPU.
+        // Experts outside the VRAM cache with a host copy go to the CPU, fewest rows first, up to the point where
+        // the CPU pool's work (growing with rows per expert once compute exceeds memory read) balances the remaining
+        // copies of this layer's walk.  "Outside" is the cache's own table, except experts already staged ahead during
+        // the attention half stay on the GPU.
+        const bool have_ahead = ahead_n > 0 && m.ahead_layer[l & 1] == l;
         std::vector<std::pair<int32_t, int32_t>> cand;   // (rows, expert)
         for (int32_t e = 0; e < m.g->n_expert; ++e) {
             const int32_t c = m.cnt[(size_t) e];
@@ -59,13 +60,36 @@ void Prefill::Run::Chunk::Experts::Group::cpu_select() {
                 (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e)))
                 continue;
             ++n_stream;
+            if (have_ahead && m.ahead_slot[l & 1][(size_t) e] >= 0) continue;
             int fd = -1;
             uint64_t fo = 0;
-            if (c <= basalt::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->file_extent(l, e, fd, fo)))
+            if (m.src->pinned(l, e) || !m.src->file_extent(l, e, fd, fo))
                 cand.emplace_back(c, e);
         }
         std::sort(cand.begin(), cand.end());
-        const size_t take = std::min(cand.size(), (size_t) std::llround(m.cpu_share_now * (double) n_stream));
+        size_t take = 0;
+        if (m.cpu_share_now >= 1.0) {
+            take = cand.size();
+        } else if (m.cpu_share_now > 0.0 && !cand.empty()) {
+            const double w_mem = (1.0 - m.cpu_share_now) / m.cpu_share_now;
+            const double threads = (double) std::max(1, owner.cpu_pool_->active_workers() + 1);
+            const double blob_b = (double) std::max<size_t>(1, lay.fmt[(size_t) l].bytes);
+            double cpu_sum = 0.0, gpu_rem = (double) cand.size();
+            while (take < cand.size()) {
+                const int32_t c = cand[take].first;
+                const double dm_cost = (double) ((int64_t) c * N * (int64_t) sizeof(float)) / blob_b;
+                if (dm_cost >= 1.0) break;
+                const double cpu_cost = w_mem * std::max(1.0, 0.9 * (double) c / threads);
+                const double step = cpu_cost + 1.0 - dm_cost;
+                if (cpu_sum + cpu_cost > gpu_rem - (1.0 - dm_cost)) {
+                    if (gpu_rem - cpu_sum >= 0.5 * step) ++take;
+                    break;
+                }
+                cpu_sum += cpu_cost;
+                gpu_rem -= (1.0 - dm_cost);
+                ++take;
+            }
+        }
         if (take > 0) {
             on_cpu.assign((size_t) m.g->n_expert, 0);
             for (size_t i = 0; i < take; ++i) {
@@ -99,24 +123,46 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_start() {
         const bool q2 = kc::q2_native_kernels(cf.gu_type);
         if (q2 && m.cpu_actq.size() < (size_t) T) m.cpu_actq.resize((size_t) T);
         if (!q2 && m.cpu_nact.size() < (size_t) T * kc::kNativeActBytes) m.cpu_nact.resize((size_t) T * kc::kNativeActBytes);
+        if (q2) m.cpu_act_ptrs.resize((size_t) rows_cpu);
+        else m.cpu_nact_ptrs.resize((size_t) rows_cpu);
+        m.cpu_out_ptrs.resize((size_t) rows_cpu);
         // the jobs are built here: the source's blob() is not for two threads at once
         m.cpu_need.assign((size_t) T, 0);   // the tokens the CPU's experts read
         m.cpu_jobs.clear();
+        size_t ptr_at = 0;
         for (int32_t e = 0; e < m.g->n_expert; ++e) {
             if (!on_cpu[(size_t) e]) continue;
-            kc::ExpertJobMulti j;
-            j.blob = m.src->blob(l, e);
-            if (j.blob == nullptr) { err = "prefill: expert source has no blob"; return false; }
-            j.nt = m.cnt[(size_t) e];
-            for (int r = 0; r < j.nt; ++r) {
-                const int64_t pr = (int64_t) m.off[(size_t) e] + r;
-                const int32_t tk = src_h[(size_t) pr];
-                m.cpu_need[(size_t) tk] = 1;
-                if (q2) j.act[r] = &m.cpu_actq[(size_t) tk];
-                else j.nact[r] = m.cpu_nact.data() + (size_t) tk * kc::kNativeActBytes;
-                j.out[r] = m.cpu_rows + (size_t) (pr - r0c) * N;
+            const uint8_t* blob = m.src->blob(l, e);
+            if (blob == nullptr) { err = "prefill: expert source has no blob"; return false; }
+            const int32_t cnt = m.cnt[(size_t) e];
+            for (int32_t s0 = 0; s0 < cnt; s0 += kc::kJobMaxT) {
+                const int nt = (int) std::min<int32_t>(kc::kJobMaxT, cnt - s0);
+                kc::ExpertJobMulti j;
+                j.blob = blob;
+                j.nt = nt;
+                if (nt > kc::MAXT) {
+                    if (q2) j.act_ext = m.cpu_act_ptrs.data() + ptr_at;
+                    else j.nact_ext = m.cpu_nact_ptrs.data() + ptr_at;
+                    j.out_ext = m.cpu_out_ptrs.data() + ptr_at;
+                }
+                for (int r = 0; r < nt; ++r) {
+                    const int64_t pr = (int64_t) m.off[(size_t) e] + s0 + r;
+                    const int32_t tk = src_h[(size_t) pr];
+                    m.cpu_need[(size_t) tk] = 1;
+                    float* out_p = m.cpu_rows + (size_t) (pr - r0c) * N;
+                    if (nt <= kc::MAXT) {
+                        if (q2) j.act[r] = &m.cpu_actq[(size_t) tk];
+                        else j.nact[r] = m.cpu_nact.data() + (size_t) tk * kc::kNativeActBytes;
+                        j.out[r] = out_p;
+                    } else {
+                        if (q2) m.cpu_act_ptrs[ptr_at + (size_t) r] = &m.cpu_actq[(size_t) tk];
+                        else m.cpu_nact_ptrs[ptr_at + (size_t) r] = m.cpu_nact.data() + (size_t) tk * kc::kNativeActBytes;
+                        m.cpu_out_ptrs[ptr_at + (size_t) r] = out_p;
+                    }
+                }
+                ptr_at += (size_t) nt;
+                m.cpu_jobs.push_back(j);
             }
-            m.cpu_jobs.push_back(j);
         }
         cpu_fut = std::async(std::launch::async, [&m = m, &cf, &cpu_ms = cpu_ms, q2, T = T, &owner = owner]() -> bool {
             const auto t0 = Clock::now();

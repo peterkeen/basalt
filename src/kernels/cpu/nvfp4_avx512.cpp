@@ -40,9 +40,14 @@ constexpr ScaleLut kLut{};
 constexpr int kMaxN = 16384;
 constexpr int kMaxT = 8;
 
-// The tokens' expanded Q8_0 scales, one buffer per worker thread.
-float* scale_buf() {
-    alignas(64) static thread_local float buf[kMaxT * kMaxN / 4];
+// Per token and NVFP4 block (64 weights = 2 Q8_0 blocks): 64 aligned activation bytes and 16 expanded fp32 scales.
+struct alignas(64) TokBlk512 {
+    __m512i a;
+    __m512 d;
+};
+
+TokBlk512* tok_buf() {
+    alignas(64) static thread_local TokBlk512 buf[kMaxT * (kMaxN / QK_NVFP4)];
     return buf;
 }
 
@@ -75,22 +80,23 @@ inline Blk decode(const block_nvfp4* x) {
     return b;
 }
 
-// Per token: the activation's Q8_0 scales as fp32, d0 on lanes 0..7 and d1 on lanes 8..15 for each NVFP4 block.
-// Packed per token: dv + t * 16 * nb.
+// Per NVFP4 block and token: pack the two Q8_0 blocks' bytes and scales into one cache-line-aligned TokBlk512.
 template <int NT>
-inline void token_scales(const block_q8_0* const* y, int nb, float* dv) {
-    for (int t = 0; t < NT; ++t)
-        for (int ib = 0; ib < nb; ++ib) {
+inline void prep_tokens(const block_q8_0* const* y, int nb, TokBlk512* tb) {
+    for (int ib = 0; ib < nb; ++ib)
+        for (int t = 0; t < NT; ++t) {
+            TokBlk512& dst = tb[(size_t) ib * NT + t];
+            dst.a = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*) y[t][2 * ib].qs)),
+                                       _mm256_loadu_si256((const __m256i*) y[t][2 * ib + 1].qs), 1);
             const __m256 d0 = _mm256_set1_ps(h2f(y[t][2 * ib].d));
             const __m256 d1 = _mm256_set1_ps(h2f(y[t][2 * ib + 1].d));
-            _mm512_store_ps(dv + 16 * ((size_t) t * nb + ib), _mm512_insertf32x8(_mm512_castps256_ps512(d0), d1, 1));
+            dst.d = _mm512_insertf32x8(_mm512_castps256_ps512(d0), d1, 1);
         }
 }
 
 // R rows (each its own block pointer) against NT tokens: res[k][t].
 template <int R, int NT>
-inline void rows_dot(const block_nvfp4* const* w, int nb, const block_q8_0* const* y, const float* dv,
-                     float (*res)[kMaxT]) {
+inline void rows_dot(const block_nvfp4* const* w, int nb, const TokBlk512* tb, float (*res)[kMaxT]) {
     __m512 acc[R][NT];
     for (int k = 0; k < R; ++k)
         for (int t = 0; t < NT; ++t) acc[k][t] = _mm512_setzero_ps();
@@ -107,10 +113,10 @@ inline void rows_dot(const block_nvfp4* const* w, int nb, const block_q8_0* cons
                 b[k] = decode(w[k] + ib);
             }
         }
+        const TokBlk512* tk = tb + (size_t) ib * NT;
         for (int t = 0; t < NT; ++t) {
-            const __m512i a = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*) y[t][2 * ib].qs)),
-                                                 _mm256_loadu_si256((const __m256i*) y[t][2 * ib + 1].qs), 1);
-            const __m512 d = _mm512_load_ps(dv + 16 * ((size_t) t * nb + ib));
+            const __m512i a = tk[t].a;
+            const __m512 d = tk[t].d;
             for (int k = 0; k < R; ++k) {
                 const __m512i sa = _mm512_mask_sub_epi8(a, b[k].m, zero, a);
                 const __m512i p = _mm512_dpbusd_epi32(zero, b[k].aw, sa);
@@ -128,13 +134,13 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg,
     const block_q8_0* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_0*) act[t];
     const int nb = n / QK_NVFP4;
-    float* dv = scale_buf();
-    token_scales<NT>(y, nb, dv);
+    TokBlk512* tb = tok_buf();
+    prep_tokens<NT>(y, nb, tb);
     float res[2][kMaxT];
     for (int r = r0; r < r1; ++r) {
         const block_nvfp4* w[2] = {(const block_nvfp4*) (blob + (size_t) r * gu_row),
                                    (const block_nvfp4*) (blob + up_off + (size_t) r * gu_row)};
-        rows_dot<2, NT>(w, nb, y, dv, res);
+        rows_dot<2, NT>(w, nb, tb, res);
         for (int t = 0; t < NT; ++t) {
             float g = res[0][t] * sg, u = res[1][t] * su;
             if (limit > 0.f) {
@@ -152,14 +158,14 @@ void down_rows(const uint8_t* w0, size_t row_bytes, int n, float sd, const void*
     const block_q8_0* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_0*) act[t];
     const int nb = n / QK_NVFP4;
-    float* dv = scale_buf();
-    token_scales<NT>(y, nb, dv);
+    TokBlk512* tb = tok_buf();
+    prep_tokens<NT>(y, nb, tb);
     float res[2][kMaxT];
     int r = r0;
     for (; r + 2 <= r1; r += 2) {
         const block_nvfp4* w[2] = {(const block_nvfp4*) (w0 + (size_t) r * row_bytes),
                                    (const block_nvfp4*) (w0 + (size_t) (r + 1) * row_bytes)};
-        rows_dot<2, NT>(w, nb, y, dv, res);
+        rows_dot<2, NT>(w, nb, tb, res);
         for (int t = 0; t < NT; ++t) {
             out[t][r] = res[0][t] * sd;
             out[t][r + 1] = res[1][t] * sd;
@@ -167,7 +173,7 @@ void down_rows(const uint8_t* w0, size_t row_bytes, int n, float sd, const void*
     }
     if (r < r1) {
         const block_nvfp4* w[1] = {(const block_nvfp4*) (w0 + (size_t) r * row_bytes)};
-        rows_dot<1, NT>(w, nb, y, dv, res);
+        rows_dot<1, NT>(w, nb, tb, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[0][t] * sd;
     }
 }
