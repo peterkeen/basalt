@@ -12,7 +12,7 @@ default, then the engine's. `/props` reports what is in effect. An out-of-range 
 | `repetition_penalty` | > 0 | Multiplicative penalty on tokens in the window. `1` is off. |
 | `presence_penalty`, `frequency_penalty` | number | Flat, and count-based, penalties. `0` is off. |
 | `penalty_last_n` | 0..4096 | Window for the penalties (default 64). |
-| `seed` | integer | Fixes the draw for a reproducible sampled reply. |
+| `seed` | integer | Fixes the draw for a reproducible sampled reply (on Flash-Next the same seeded request repeats run to run for the same session history: the same requests in the same order, one at a time; see [adaptive tier](adaptive.md)). |
 | `relaxed_drafting` | [0, 1] or `false` | This request's relaxed-drafting threshold. `false` or `0` forces exact sampling. |
 
 Also read: `max_tokens` / `max_completion_tokens` (`0` or `-1` = the rest of the context), `stop`, `logit_bias`, `reasoning_effort`,
