@@ -152,6 +152,13 @@ int main() {
         CHECK(decoding_loan_limit(true, 1216, true, -50, 900) == 900);     // the KV took more than the RAM-backed slots
         CHECK(decoding_loan_limit(true, 1216, true, 0, 0) == 0);           // nothing funded: no loan
         CHECK(decoding_loan_limit(true, -1, true, 10, 10) == 0);           // a negative cap lends nothing
+        // kBesideChunkFloor (#414): funded file refills keep the read beside when they cover the floor, else it runs alone
+        CHECK(decoding_loan_limit(true, 1216, true, 0, 900, 700) == 900);  // file refills cover the floor: stays beside
+        CHECK(decoding_loan_limit(true, 1216, true, 0, 900, 900) == 900);  // exact floor fit: stays beside
+        CHECK(decoding_loan_limit(true, 1216, true, 0, 900, 901) == -1);   // even funded loan below floor: reads alone
+        CHECK(decoding_loan_limit(true, 1216, true, 200, 600, 800) == 800); // RAM + file together cover the floor
+        CHECK(decoding_loan_limit(true, 1216, true, 200, 599, 800) == -1);  // RAM + file one short of floor: reads alone
+        CHECK(decoding_loan_limit(true, 500, false, 0, 0, 600) == -1);     // cap itself below floor: reads alone
     }
     // the split: the entries the next loan takes again, and the rest, in their order
     {

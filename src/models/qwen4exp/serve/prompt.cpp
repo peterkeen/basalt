@@ -4,6 +4,11 @@
 
 namespace basalt::models::qwen4exp::serve {
 
+namespace {
+// The ring depth of a read laid out for an idle card: deeper than any chunk needs, so the layout takes its own.
+constexpr int kFullRing = 1 << 20;
+}  // namespace
+
 int64_t QfnRuntime::part_slots(const PfPart& p, int64_t c) {
     const basalt::core::SessionState& ses = (p.sp == &sp && rsp != nullptr) ? *rsp : *p.ses;
     const int64_t st_cells = (p.sp == &sp) ? prefill_stage_cells : 0;
@@ -124,11 +129,13 @@ bool QfnRequest::refill(std::string& e) {
 // participant's own cache, and marking only that participant's own layers
 // `chunk` > 0: that chunk (a split read's), its first one `head` tokens (0: none)
 bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) {
+    // whether the slots decode while this part is read: it decides the layout, and read_part() reads the part alone
+    // when it is false
+    beside_ = runtime_.batch_on() && (tokens > runtime_.kReadAlone || resumed_chunk > 0);
     if (runtime_.pf_parts.empty()) return true;                     // its own buffers: nothing to lend
     // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
     // the full depth is restored on the way out for the sizing done elsewhere
-    const bool beside = runtime_.batch_on() && (tokens > runtime_.kReadAlone || resumed_chunk > 0);
-    basalt::prefill::Prefill::set_ring_depth(beside ? runtime_.kRingDecoding : 1 << 20);
+    basalt::prefill::Prefill::set_ring_depth(beside_ ? runtime_.kRingDecoding : kFullRing);
     const int64_t prev_stage_cells = runtime_.prefill_stage_cells;
     runtime_.prefill_stage_cells = n;
     runtime_.sp.set_stage_cells(n);
@@ -136,7 +143,7 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
         int64_t* sc;
         int64_t prev;
         ~RingReset() {
-            basalt::prefill::Prefill::set_ring_depth(1 << 20);
+            basalt::prefill::Prefill::set_ring_depth(kFullRing);
             *sc = prev;
         }
     } ring_reset{&runtime_.prefill_stage_cells, prev_stage_cells};
@@ -151,9 +158,10 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     // Loan limits while slots decode (see decoding_loan_limit): a read alone stops the slots, so it lends as on an
     // idle engine; a read beside them stays within kLendCapDecoding slots (they keep their experts in the cache) and
     // within the lent slots refilled from RAM plus those one chunk's funded file reads refill (the RAM floor keeps
-    // that much file cache).  The chunk shrinks to the loan, but not below the smallest chunk the prompt path runs.
+    // that much file cache).  A loan under kBesideChunkFloor is not worth sharing the card for: the part reads alone,
+    // in the full ring, and the slots wait.
     int64_t loan_lim = std::numeric_limits<int64_t>::max();
-    if (runtime_.batch_on()) {
+    if (beside_) {
         // the RAM-backed slots are the cache's last ones: those still live after the KV took its share
         const bool ram_limited = runtime_.src.complement_ready();
         const int64_t ram_lent = ram_limited ? runtime_.src.resident_lent_slots() -
@@ -161,11 +169,19 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
                                              : 0;
         const int64_t file_lent = (int64_t) (basalt::platform::kPromptFileReadBytes /
                                              std::max<uint64_t>(1, basalt::kernels::cpu::expert_layout().max_blob));
-        const int64_t lim = serve_loans::decoding_loan_limit(beside, runtime_.kLendCapDecoding, ram_limited, ram_lent,
-                                                             file_lent);
-        if (lim >= 0) loan_lim = lim;
+        const int64_t floor_slots = runtime_.pf_parts[0].first >= 0
+                                        ? runtime_.part_slots(runtime_.pf_parts[0], runtime_.kBesideChunkFloor)
+                                        : 0;
+        const int64_t lim = serve_loans::decoding_loan_limit(beside_, runtime_.kLendCapDecoding, ram_limited, ram_lent,
+                                                             file_lent, floor_slots);
+        if (lim >= 0) {
+            loan_lim = lim;
+        } else {
+            beside_ = false;
+            basalt::prefill::Prefill::set_ring_depth(kFullRing);
+        }
     }
-    if (loan_lim != std::numeric_limits<int64_t>::max() && !runtime_.pf_parts.empty() && runtime_.pf_parts[0].first >= 0) {
+    if (loan_lim != std::numeric_limits<int64_t>::max() && runtime_.pf_parts[0].first >= 0) {
         const int64_t lc = std::max<int64_t>(256, engine_local::biggest_chunk(cap, [&](int64_t t) {
             return runtime_.part_slots(runtime_.pf_parts[0], t) <= loan_lim;
         }));
@@ -178,7 +194,7 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
         }));
         cap = std::min(cap, lc);
     }
-    auto [want_full, head_tok] = serve_loans::one_card_chunks(tokens, cap, !beside && runtime_.stages.empty(),
+    auto [want_full, head_tok] = serve_loans::one_card_chunks(tokens, cap, !beside_ && runtime_.stages.empty(),
                                                            runtime_.o.prefill_auto_fit);
     // a chunk the read must have: a split read's, or the one the read this continues had (if it fits)
     const int64_t fixed_chunk = chunk > 0 ? chunk : (resumed_chunk > 0 && resumed_chunk <= cap) ? resumed_chunk : 0;
@@ -219,7 +235,7 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
             if (!refill_one(p, e)) return false;
         }
         const basalt::core::OnDevice on(p.dev);
-        if (beside && &p == &runtime_.pf_parts[0] && p.lent.empty()) {
+        if (beside_ && &p == &runtime_.pf_parts[0] && p.lent.empty()) {
             if (runtime_.ba_job) { runtime_.ba_thr.join(); runtime_.ba_job = false; }   // no adaptive copy lands in a slot it moves
             if (!runtime_.xq_drain()) { e = "an adaptive refill failed"; return false; }
             if (!runtime_.move_routed_below(first, "prompt loan", e, &again)) return false;
