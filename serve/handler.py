@@ -59,6 +59,7 @@ def make_handler(target: Service | Router):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
+        disable_nagle_algorithm = True                      # streamed events go at once: no waiting for a coalesced segment
 
         watch_done = None                                   # stops this request's disconnect watcher
         cancel = None                                       # set when the client left
