@@ -63,8 +63,7 @@ Three quiet figures sit in it, each from `/metrics`:
 - `N requests served · M tokens written` under the Slots table (`totals`: requests, prompt, reused and written tokens, prompt
   and decode time since the server started; the rest in the tooltip).
 - The header word reads `Thinking`, `Answering` or `Tool call` (`live.phase`) while exactly one request runs.
-
-- **Prometheus:** `GET /metrics` returns Prometheus text exposition format (`text/plain; version=0.0.4`) when `Accept` asks for `text/plain` or `application/openmetrics-text`, or with `?format=prometheus` (JSON otherwise, so the stats page is unchanged). Uses vLLM-compatible metric names (`vllm:*`) where an equivalent exists, plus Basalt engine and hardware metrics under `basalt:`.
+- **Prometheus:** `GET /metrics` returns Prometheus text exposition format (`text/plain; version=0.0.4`) when `Accept` asks for `text/plain` or `application/openmetrics-text`, or with `?format=prometheus` (JSON otherwise, so the stats page is unchanged). Every metric is named `basalt_*` (requests, tokens, latency histograms, draft acceptance, engine state, GPU and RAM); a dashboard made for another engine's names can use Prometheus relabeling.
 
 The log panel shows the engine's long cache lines short (`cache: restored 187k tokens in 912 ms`); the log and `/api/logs`
 keep the raw line.
